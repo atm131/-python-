@@ -16,12 +16,21 @@ class PetConfig:
     # 窗口尺寸
     width: int = 200
     height: int = 200
-    # 巡逻参数
-    patrol_speed: float = 1.5          # 像素/帧
-    patrol_interval_ms: int = 30       # 帧间隔(ms)
-    screen_margin: int = 20            # 距屏幕边缘最小距离
-    # 动画帧间隔
-    anim_frame_ms: int = 500           # 状态动画切换间隔
+    # 宠物图片路径（相对于项目根目录，或绝对路径）
+    image_path: str = r"E:\毕业设计\shuchaiku\nv.png"
+
+
+@dataclass(frozen=True)
+class WeatherConfig:
+    """天气查询参数"""
+
+    # ───────────────────────────────────────────────────
+    # 请在此处填写你的 OpenWeatherMap API Key
+    # 免费注册：https://openweathermap.org/api
+    # ───────────────────────────────────────────────────
+    api_key: str = os.getenv("OWM_API_KEY", "")
+    city: str = ""                # 留空则自动通过 IP 定位获取城市
+    lang: str = "zh_cn"           # 返回语言
 
 
 @dataclass(frozen=True)
@@ -87,10 +96,14 @@ class AppConfig:
     """顶层配置容器，聚合所有子配置"""
 
     pet: PetConfig = field(default_factory=PetConfig)
+    weather: WeatherConfig = field(default_factory=WeatherConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+
+    # 窗口初始位置（可选，None 则自动定位到屏幕右下角）
+    window: dict = field(default_factory=lambda: {"init_x": None, "init_y": None})
 
     # 插件目录
     plugins_dir: str = "plugins"
