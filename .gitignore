@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+crash.log
+knowledge_db/
+.env
+*.db
