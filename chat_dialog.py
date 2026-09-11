@@ -4,11 +4,13 @@ AI 对话窗口模块
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QColor, QPainter, QPainterPath
+from html import escape as html_escape
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit,
-    QPushButton, QLabel, QFrame, QSizePolicy, QApplication,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit,
+    QPushButton, QLabel, QFrame,
 )
 
 from db_manager import DBManager
@@ -89,13 +91,18 @@ class ChatWorker(QThread):
     """后台线程处理 AI 对话，避免阻塞 UI"""
     finished = pyqtSignal(str)
 
-    def __init__(self, ai_service: AIService, message: str):
+    def __init__(self, ai_service: AIService, message: str, handler=None):
         super().__init__()
         self.ai_service = ai_service
         self.message = message
+        # handler 用于插件命令等自定义处理逻辑（同样在后台线程执行）
+        self.handler = handler
 
     def run(self):
-        response = self.ai_service.chat(self.message)
+        if self.handler is not None:
+            response = self.handler(self.message)
+        else:
+            response = self.ai_service.chat(self.message)
         self.finished.emit(response)
 
 
@@ -107,11 +114,13 @@ class ChatDialog(QDialog):
     单击宠物时弹出，可以与 AI 进行对话
     """
 
-    def __init__(self, db: DBManager, parent=None):
+    def __init__(self, db: DBManager, parent=None, plugin_manager=None):
         super().__init__(parent)
         self.db = db
         self.ai_service = AIService(db)
+        self.plugin_manager = plugin_manager  # 支持 /天气 等插件命令
         self._chat_worker = None
+        self._thinking_pos = None  # "思考中"占位消息的文档位置
         self._init_ui()
 
     def _init_ui(self):
@@ -136,8 +145,9 @@ class ChatDialog(QDialog):
         title_layout.addWidget(title_label)
 
         # 当前模型标签
-        model_text = f"当前模型: {self.ai_service.current_model}"
-        if self.ai_service.is_free_model():
+        model_name = self.ai_service.current_model
+        model_text = f"当前模型: {model_name}"
+        if self.ai_service.is_free_model() and "免费" not in model_name:
             model_text += " (免费)"
         self.model_label = QLabel(model_text)
         self.model_label.setStyleSheet(f"""
@@ -172,7 +182,7 @@ class ChatDialog(QDialog):
         input_layout.setSpacing(12)
 
         # 提示标签
-        hint_label = QLabel("💡 输入你的问题，按 Enter 或点击发送按钮")
+        hint_label = QLabel("💡 输入问题按 Enter 发送；也支持 /天气 北京 等插件命令")
         hint_label.setStyleSheet(f"""
             font-size: 12px;
             color: {TEXT_SECONDARY};
@@ -263,21 +273,40 @@ class ChatDialog(QDialog):
         self.btn_send.setEnabled(False)
         self.btn_send.setText("思考中...")
 
-        # 添加等待提示
+        # 记录位置后插入等待提示，回复到达时按位置回滚
+        self._thinking_pos = self.chat_history.document().characterCount() - 1
         self._add_message("🤖 AI 助手", "正在思考中...", is_user=False)
 
+        # 以 "/" 开头优先走插件命令（如 /天气 北京），未匹配则回退到 AI
+        handler = None
+        if self.plugin_manager is not None and message.startswith("/"):
+            handler = self._dispatch_or_chat
+
         # 启动 AI 回复线程
-        self._chat_worker = ChatWorker(self.ai_service, message)
+        self._chat_worker = ChatWorker(self.ai_service, message, handler=handler)
         self._chat_worker.finished.connect(self._on_ai_response)
         self._chat_worker.start()
 
+    def _dispatch_or_chat(self, message: str) -> str:
+        """先尝试插件命令，无匹配命令再交给 AI（在后台线程中执行）"""
+        result = self.plugin_manager.dispatch_command(message)
+        if result is not None:
+            return result
+        return self.ai_service.chat(message)
+
     def _on_ai_response(self, response: str):
         """AI 回复完成"""
-        # 移除"思考中"的消息
-        self._remove_last_message()
+        # 移除"思考中"的占位消息
+        if self._thinking_pos is not None:
+            self._remove_last_message(self._thinking_pos)
+            self._thinking_pos = None
 
         # 显示 AI 回复
         self._add_message("🤖 AI 助手", response, is_user=False)
+
+        # 通知事件总线，宠物可以据此切换表情（桌宠收到回复 → 开心）
+        if self.plugin_manager is not None:
+            self.plugin_manager.bus.emit("chat.reply", {"response": response})
 
         # 恢复输入
         self.input_field.setEnabled(True)
@@ -285,8 +314,13 @@ class ChatDialog(QDialog):
         self.btn_send.setText("发送")
         self.input_field.setFocus()
 
-    def _add_message(self, sender: str, message: str, is_user: bool):
-        """添加消息到对话历史"""
+    def _add_message(self, sender: str, message: str, is_user: bool) -> int:
+        """
+        添加消息到对话历史。
+
+        返回插入前的文档位置，调用方可在需要时回滚到该位置。
+        消息内容做 HTML 转义，避免用户输入 <、> 等字符破坏气泡排版。
+        """
         # 设置消息样式
         if is_user:
             align = "right"
@@ -297,6 +331,12 @@ class ChatDialog(QDialog):
             bg_color = CARD_BG
             text_color = TEXT_PRIMARY
 
+        # 记录插入位置（供回滚使用）
+        insert_pos = max(self.chat_history.document().characterCount() - 1, 0)
+
+        safe_sender = html_escape(sender)
+        safe_message = html_escape(message).replace("\n", "<br>")
+
         # 构建 HTML 消息
         html = f"""
         <div style="text-align: {align}; margin: 8px 0;">
@@ -306,11 +346,11 @@ class ChatDialog(QDialog):
                         box-shadow: 0 1px 2px rgba(0,0,0,0.1);">
                 <div style="font-size: 12px; color: {TEXT_SECONDARY};
                             margin-bottom: 4px; font-weight: 600;">
-                    {sender}
+                    {safe_sender}
                 </div>
                 <div style="font-size: 13px; color: {text_color};
                             line-height: 1.5; word-wrap: break-word;">
-                    {message}
+                    {safe_message}
                 </div>
             </div>
         </div>
@@ -321,25 +361,34 @@ class ChatDialog(QDialog):
         # 滚动到底部
         scrollbar = self.chat_history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+        return insert_pos
 
-    def _remove_last_message(self):
-        """移除最后一条消息（用于移除"思考中"的提示）"""
-        # 获取当前文本
-        text = self.chat_history.toHtml()
+    def _remove_last_message(self, from_pos: int):
+        """
+        删除从 from_pos 到文档末尾的内容（用于移除"思考中"的占位消息）。
 
-        # 找到最后一个消息块的起始位置
-        last_div_end = text.rfind("</div>")
-        if last_div_end == -1:
+        直接对 toHtml() 做字符串裁剪不可靠（Qt 会重写 HTML 结构），
+        这里用 QTextCursor 按文档位置删除，并清掉可能残留的空段落。
+        """
+        if from_pos < 0:
             return
+        cursor = self.chat_history.textCursor()
+        cursor.setPosition(from_pos)
+        cursor.movePosition(QTextCursor.MoveOperation.End,
+                            QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
 
-        # 找到对应的开始位置
-        last_div_start = text.rfind("<div", 0, last_div_end)
-        if last_div_start == -1:
-            return
+        # removeSelectedText 可能留下一个空段落，一并清理
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        if not cursor.selectedText().strip():
+            cursor.removeSelectedText()
 
-        # 移除最后一个消息块
-        new_text = text[:last_div_start]
-        self.chat_history.setHtml(new_text)
+    def closeEvent(self, event):
+        """关闭前等待后台线程结束，避免线程回调已销毁的窗口"""
+        if self._chat_worker and self._chat_worker.isRunning():
+            self._chat_worker.wait(3000)
+        super().closeEvent(event)
 
     def _clear_history(self):
         """清空对话历史"""

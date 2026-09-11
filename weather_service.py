@@ -24,12 +24,17 @@ class WeatherService:
 
     # wttr.in JSON API（完全免费，无需注册）
     _WTTR_API = "https://wttr.in/{city}?format=j1&lang=zh"
-    # IP 地理定位 API 列表（按优先级排列）
+    # 请求头：部分接口会拒绝默认的 python-requests UA
+    _HEADERS = {"User-Agent": "SmartDesktopPet/3.0", "Accept-Language": "zh-CN"}
+    # IP 地理定位 API 列表
+    # 顺序按实测可靠性排列：ipinfo.io 最稳定；
+    # ip-api.com 走 HTTP 80 端口、ipapi.co 有限流、ip.seeip.org 连接不稳定，
+    # 均作为兜底候选，任何一个成功即返回。
     _GEO_APIS = [
-        {"url": "http://ip-api.com/json/?lang=zh-CN&fields=status,country,city", "timeout": 3},
-        {"url": "https://ipapi.co/json/", "timeout": 3},
         {"url": "https://ipinfo.io/json", "timeout": 3},
+        {"url": "http://ip-api.com/json/?lang=zh-CN&fields=status,country,city", "timeout": 3},
         {"url": "https://ip.seeip.org/jsonip?", "timeout": 3},
+        {"url": "https://ipapi.co/json/", "timeout": 3},
     ]
 
     def __init__(self, db: DBManager):
@@ -68,7 +73,8 @@ class WeatherService:
         """
         for i, api in enumerate(WeatherService._GEO_APIS):
             try:
-                resp = requests.get(api["url"], timeout=api["timeout"])
+                resp = requests.get(api["url"], timeout=api["timeout"],
+                                    headers=WeatherService._HEADERS)
                 resp.raise_for_status()
                 data = resp.json()
 
@@ -143,7 +149,7 @@ class WeatherService:
 
         try:
             url = self._WTTR_API.format(city=city_en)
-            resp = requests.get(url, timeout=10, headers={"Accept-Language": "zh-CN"})
+            resp = requests.get(url, timeout=10, headers=self._HEADERS)
             resp.raise_for_status()
             data = resp.json()
 

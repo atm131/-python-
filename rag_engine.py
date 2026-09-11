@@ -6,10 +6,8 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import threading
 from dataclasses import dataclass
-from typing import Any, Iterator
 
 import requests
 
@@ -53,14 +51,26 @@ class VectorStore:
     # ── Embedding 模型 ───────────────────────────
 
     def _get_model(self):
-        """延迟加载 sentence-transformers 模型"""
+        """
+        延迟加载 sentence-transformers 模型。
+
+        local_files_only=True：只使用本地已缓存的模型。
+        否则首次调用会联网下载模型，在无外网环境下会导致界面长时间卡死；
+        模型缺失或依赖未安装时统一降级为哈希伪向量，保证离线可用。
+        """
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
                 print(f"[RAG] 加载 Embedding 模型: {self.config.embedding_model}")
-                self._model = SentenceTransformer(self.config.embedding_model)
+                self._model = SentenceTransformer(
+                    self.config.embedding_model, local_files_only=True)
+                print("[RAG] Embedding 模型加载完成")
             except ImportError:
-                print("[RAG] ⚠️ sentence-transformers 未安装，使用哈希伪向量")
+                print("[RAG] ⚠️ sentence-transformers 未安装，使用哈希伪向量（离线降级）")
+                self._model = "hash_fallback"
+            except Exception as e:
+                print(f"[RAG] ⚠️ 本地无可用模型（{type(e).__name__}），"
+                      f"使用哈希伪向量（离线降级）")
                 self._model = "hash_fallback"
         return self._model
 
@@ -297,3 +307,27 @@ class LLMClient:
             daemon=True,
             name="LLMChat",
         ).start()
+
+
+# ─── 独立演示入口 ─────────────────────────────────────────
+# 说明：本模块是可选的知识库扩展，主程序默认不加载。
+# 运行 python rag_engine.py 可离线验证「分块 → 向量化 → 检索」流程。
+
+if __name__ == "__main__":
+    from config import RAGConfig
+
+    bus = EventBus()
+    store = VectorStore(RAGConfig())
+
+    added = store.add_document(
+        "桌面宠物是常驻桌面的小助手，可以查询天气、监控系统状态、进行 AI 对话。\n"
+        "它支持 DeepSeek、OpenAI、豆包、通义千问、Kimi 等多个 AI 模型。\n"
+        "系统监控模块会采集 CPU、内存、磁盘和网络的使用情况。",
+        source="demo",
+    )
+    print(f"已导入 {added} 个知识块，当前共 {store.get_stats()['total_chunks']} 块")
+
+    for query in ["怎么查询天气", "支持哪些 AI 模型"]:
+        print(f"\n查询: {query}")
+        for r in store.search(query):
+            print(f"  [{r['score']:.3f}] {r['text'][:36].strip()}...")

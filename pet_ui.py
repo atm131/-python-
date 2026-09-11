@@ -6,32 +6,24 @@ from __future__ import annotations
 
 import math
 import sys
-import time
 from enum import Enum, auto
-from typing import Any
 
 from PyQt6.QtCore import (
-    QEasingCurve,
-    QEvent,
-    QMimeData,
     QPoint,
     QPointF,
     QRect,
     Qt,
     QTimer,
-    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush,
     QColor,
-    QCursor,
-    QDrag,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
 )
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PyQt6.QtWidgets import QApplication, QWidget
 
 from config import AppConfig, PetConfig, UIConfig
 from plugin_manager import EventBus
@@ -139,13 +131,16 @@ class PetAnimator:
         pen = QPen(QColor("#1a1a1a"), 2)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
+        if shape == "open":
+            # 张嘴：画一个实心椭圆，无需路径
+            p.setBrush(QBrush(QColor("#1a1a1a")))
+            p.drawEllipse(QPointF(cx, mouth_y), r * 0.12, r * 0.1)
+            return
+
         path = QPainterPath()
         if shape == "smile":
             path.moveTo(cx - r * 0.2, mouth_y)
             path.quadTo(QPointF(cx, mouth_y + r * 0.15), QPointF(cx + r * 0.2, mouth_y))
-        elif shape == "open":
-            p.setBrush(QBrush(QColor("#1a1a1a")))
-            p.drawEllipse(QPointF(cx, mouth_y), r * 0.12, r * 0.1)
         elif shape == "tired":
             path.moveTo(cx - r * 0.15, mouth_y + r * 0.05)
             path.quadTo(QPointF(cx, mouth_y - r * 0.05), QPointF(cx + r * 0.15, mouth_y + r * 0.05))
@@ -235,30 +230,65 @@ class ChatBubble(QWidget):
     """
     宠物头顶的对话气泡。
     支持自动换行、自动隐藏、渐入渐出。
+
+    注意：必须是【独立顶层窗口】。Qt 会把子控件裁剪到父窗口矩形内，
+    而气泡显示在宠物窗口上方（父窗口之外），做成子控件会被完全裁掉。
     """
 
-    def __init__(self, parent: QWidget, config: UIConfig):
-        super().__init__(parent)
+    def __init__(self, config: UIConfig):
+        super().__init__(None)  # 顶层窗口
         self.config = config
         self._text = ""
         self._opacity = 0.0
         self._visible = False
-        self._fade_timer = QTimer(self)
-        self._fade_timer.timeout.connect(self._fade_step)
+        self._fading_out = False
+        self._fade_out_timer: QTimer | None = None
+
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setFixedWidth(config.bubble_max_width)
 
+        self._fade_timer = QTimer(self)
+        self._fade_timer.timeout.connect(self._fade_step)
+
     def show_message(self, text: str, duration_ms: int = 5000):
-        """显示气泡消息，duration_ms 后自动隐藏"""
+        """显示气泡消息，duration_ms 后自动淡出"""
+        # 取消上一次的淡出计划，避免旧定时器提前触发
+        if self._fade_out_timer:
+            self._fade_out_timer.stop()
+
         self._text = text
         self._opacity = 1.0
         self._visible = True
-        self._duration = duration_ms
-        self._fade_timer.start(50)
+        self._fading_out = False
+        self._fade_timer.stop()
         self._adjust_size()
         self.update()
-        # 自动隐藏定时器
-        QTimer.singleShot(duration_ms, self._start_fade_out)
+        self.show()
+        self.raise_()
+
+        self._fade_out_timer = QTimer()
+        self._fade_out_timer.setSingleShot(True)
+        self._fade_out_timer.timeout.connect(self._start_fade_out)
+        self._fade_out_timer.start(duration_ms)
+
+    def hide_bubble(self):
+        """立即隐藏气泡"""
+        if self._fade_out_timer:
+            self._fade_out_timer.stop()
+            self._fade_out_timer = None
+        self._fade_timer.stop()
+        self._opacity = 0.0
+        self._visible = False
+        self._fading_out = False
+        self.hide()
 
     def _adjust_size(self):
         from PyQt6.QtGui import QFont, QFontMetrics
@@ -273,15 +303,19 @@ class ChatBubble(QWidget):
 
     def _start_fade_out(self):
         self._fading_out = True
+        self._fade_out_timer = None
+        self._fade_timer.start(50)
 
     def _fade_step(self):
-        if hasattr(self, "_fading_out") and self._fading_out:
-            self._opacity -= 0.05
-            if self._opacity <= 0:
-                self._opacity = 0
-                self._visible = False
-                self._fading_out = False
-                self._fade_timer.stop()
+        if not self._fading_out:
+            return
+        self._opacity -= 0.05
+        if self._opacity <= 0:
+            self._opacity = 0
+            self._visible = False
+            self._fading_out = False
+            self._fade_timer.stop()
+            self.hide()
         self.update()
 
     def paintEvent(self, event):
@@ -348,13 +382,17 @@ class DesktopPet(QWidget):
         # 拖拽状态
         self._dragging = False
         self._drag_offset = QPoint()
+        self._press_pos = QPoint()
+        self._drag_threshold = 5
+
+        # 当前动画帧缓存（避免 paintEvent 与定时器各生成一帧）
+        self._current_frame = self.animator.next_frame()
 
         # 初始化窗口
         self._init_window()
 
-        # 对话气泡
-        self.bubble = ChatBubble(self, self.ui_config)
-        self._position_bubble()
+        # 对话气泡（独立顶层窗口）
+        self.bubble = ChatBubble(self.ui_config)
 
         # 动画定时器
         self._anim_timer = QTimer(self)
@@ -404,6 +442,9 @@ class DesktopPet(QWidget):
         """
         更新鼠标穿透区域。
         将宠物身体的圆形区域设为可交互，其余区域穿透。
+
+        气泡是独立顶层窗口，且已设 WA_TransparentForMouseEvents，
+        因此不参与这里的 mask 计算。
         """
         from PyQt6.QtGui import QRegion
         cx = self.pet_config.width // 2
@@ -412,54 +453,60 @@ class DesktopPet(QWidget):
         # 创建圆形 mask：圆形区域内可接收鼠标事件
         region = QRegion(cx - r, cy - r, r * 2, r * 2,
                          QRegion.RegionType.Ellipse)
-        # 气泡区域也需要可交互
-        if self.bubble._visible:
-            bubble_region = QRegion(self.bubble.geometry())
-            region = region.united(bubble_region)
         self.setMask(region)
 
     # ── 动画更新 ──────────────────────────────────
 
     def _update_animation(self):
-        """定时刷新动画帧"""
-        pixmap = self.animator.next_frame()
-        # 如果有 QLabel 用于显示，可在此更新
+        """定时刷新动画帧（生成一帧并缓存，由 paintEvent 绘制）"""
+        self._current_frame = self.animator.next_frame()
         self.update()  # 触发 paintEvent
-        self._update_mask()
 
     def paintEvent(self, event):
         """绘制宠物本体"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # 绘制当前动画帧
-        pixmap = self.animator.next_frame()
-        painter.drawPixmap(0, 0, pixmap)
+        painter.drawPixmap(0, 0, self._current_frame)
         painter.end()
 
     # ── 鼠标事件 ──────────────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
+            self._press_pos = event.globalPosition().toPoint()
             self._drag_offset = event.pos()
-            self.animator.state = PetState.DRAGGING
-            self.bus.emit("pet.drag_start", {"pos": (self.x(), self.y())})
+            self._moved = False
         elif event.button() == Qt.MouseButton.RightButton:
-            self._show_context_menu(event.globalPos())
+            # PyQt6 中 QMouseEvent 没有 globalPos()，应使用 globalPosition()
+            self._show_context_menu(event.globalPosition().toPoint())
 
     def mouseMoveEvent(self, event):
-        if self._dragging:
-            new_pos = event.globalPosition().toPoint() - self._drag_offset
-            self.move(new_pos)
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        cur = event.globalPosition().toPoint()
+        if not self._dragging:
+            delta = cur - self._press_pos
+            if abs(delta.x()) <= self._drag_threshold and abs(delta.y()) <= self._drag_threshold:
+                return
+            self._dragging = True
+            self._moved = True
+            self.animator.state = PetState.DRAGGING
+            self.bus.emit("pet.drag_start", {"pos": (self.x(), self.y())})
+
+        self.move(cur - self._drag_offset)
+        if self.bubble.isVisible():
+            self._position_bubble()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
-            self._dragging = False
-            self.animator.state = PetState.IDLE
-            self.bus.emit("pet.drag_end", {"pos": (self.x(), self.y())})
-            # 拖拽结束视为单击
-            self.bus.emit("pet.clicked", {})
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._dragging:
+                self._dragging = False
+                self.animator.state = PetState.IDLE
+                self.bus.emit("pet.drag_end", {"pos": (self.x(), self.y())})
+            elif not getattr(self, "_moved", False):
+                # 未发生位移才视为单击
+                self.bus.emit("pet.clicked", {})
+            self._moved = False
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -501,6 +548,8 @@ class DesktopPet(QWidget):
     def _patrol_step(self):
         """宠物在屏幕边缘自主巡逻"""
         if not self._patrolling or self._dragging:
+            if self.animator.state == PetState.WALKING:
+                self.animator.state = PetState.IDLE
             return
 
         self.animator.state = PetState.WALKING
@@ -520,13 +569,22 @@ class DesktopPet(QWidget):
             self.bus.emit("pet.patrol_turn", {"direction": "right"})
 
         self.move(new_x, self.y())
+        if self.bubble.isVisible():
+            self._position_bubble()
 
     # ── 气泡定位 ──────────────────────────────────
 
     def _position_bubble(self):
-        """将气泡定位在宠物头顶"""
-        bx = (self.width() - self.bubble.width()) // 2
-        by = -self.bubble.height() - 5
+        """将气泡定位在宠物头顶（全局屏幕坐标）"""
+        screen = QApplication.primaryScreen().availableGeometry()
+        bw, bh = self.bubble.width(), self.bubble.height()
+        pet = self.frameGeometry()
+
+        bx = pet.center().x() - bw // 2
+        by = pet.top() - bh - 5
+        if by < screen.top():
+            by = pet.bottom() + 5
+        bx = max(screen.left(), min(bx, screen.right() - bw))
         self.bubble.move(bx, by)
 
     # ── 事件总线监听 ──────────────────────────────
@@ -536,6 +594,15 @@ class DesktopPet(QWidget):
         self.bus.on("monitor.load_change", self._on_load_change)
         self.bus.on("llm.stream_start", lambda e: self._set_state(PetState.THINKING))
         self.bus.on("llm.stream_end", self._on_stream_end)
+        # 其他模块（插件等）通过事件总线请求显示气泡
+        self.bus.on("pet.show_bubble", self._on_show_bubble)
+
+    def _on_show_bubble(self, event):
+        """响应气泡显示请求"""
+        self.show_bubble(
+            event.data.get("text", ""),
+            event.data.get("duration", 3000),
+        )
 
     def _on_load_change(self, event):
         """系统负载变化时切换宠物状态"""
@@ -561,7 +628,38 @@ class DesktopPet(QWidget):
     # ── 公共接口 ──────────────────────────────────
 
     def show_bubble(self, text: str, duration_ms: int = 5000):
-        """显示对话气泡"""
-        self._position_bubble()
+        """显示对话气泡（先填充内容，再按实际尺寸定位）"""
         self.bubble.show_message(text, duration_ms)
-        self._update_mask()
+        self._position_bubble()
+
+
+# ─── 独立演示入口 ─────────────────────────────────────────
+# 说明：正式桌面宠物主界面是 pet_window.py（贴图 + 天气 + 对话 + 菜单）。
+# 本模块是「动画状态机 + 自主巡逻 + 事件总线」的实验版本，
+# 可用 python pet_ui.py 单独运行演示。
+
+if __name__ == "__main__":
+    from config import AppConfig
+
+    app = QApplication(sys.argv)
+    bus = EventBus()
+    config = AppConfig()
+
+    pet = DesktopPet(config, bus)
+    pet.show()
+    pet.show_bubble("演示模式：动画状态机 + 自主巡逻 + 事件总线", 6000)
+
+    # 交互演示：点击 / 双击 切换气泡
+    bus.on("pet.clicked", lambda e: pet.show_bubble("你点了我一下～", 3000))
+    bus.on("pet.double_clicked", lambda e: pet.show_bubble("双击！有什么可以帮你的？", 3000))
+    # 拖拽时提示
+    bus.on("pet.drag_end", lambda e: bus.emit(
+        "pet.show_bubble", {"text": f"新位置: {e.data['pos']}", "duration": 2000}))
+
+    # 系统负载联动演示：8 秒后模拟高负载，14 秒后恢复
+    QTimer.singleShot(8000, lambda: bus.emit(
+        "monitor.load_change", {"old_level": "normal", "new_level": "warning"}))
+    QTimer.singleShot(14000, lambda: bus.emit(
+        "monitor.load_change", {"old_level": "warning", "new_level": "normal"}))
+
+    sys.exit(app.exec())

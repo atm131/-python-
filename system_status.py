@@ -9,6 +9,11 @@ import platform
 from datetime import datetime
 from typing import Dict, Any
 
+# 预热 CPU 采样：cpu_percent(interval=None) 返回「自上次调用以来」的平均占用率，
+# 首次调用固定返回 0.0。在模块导入时先触发一次，之后查询即可立刻拿到有效值，
+# 避免用 interval=1 阻塞 UI 线程整整一秒。
+psutil.cpu_percent(interval=None)
+
 
 class SystemStatus:
     """
@@ -20,7 +25,7 @@ class SystemStatus:
     def get_cpu_info() -> Dict[str, Any]:
         """获取 CPU 信息"""
         try:
-            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_percent = psutil.cpu_percent(interval=None)  # 非阻塞，立即返回
             cpu_count = psutil.cpu_count()
             cpu_freq = psutil.cpu_freq()
 

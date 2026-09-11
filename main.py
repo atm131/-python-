@@ -17,15 +17,19 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from datetime import datetime
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from config import UIConfig
+from config import MonitorConfig, UIConfig
 from db_manager import DBManager
 from pet_window import PetWindow
+from plugin_manager import EventBus, PluginManager
+from system_monitor import SystemMonitor
 from weather_service import WeatherService
 
 
@@ -45,6 +49,12 @@ def excepthook(exc_type, exc_value, exc_tb):
 
 sys.excepthook = excepthook
 
+# 应用图标（宠物形象，相对项目路径，随项目一起拷贝）
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+ICON_PATH = os.path.join(ASSETS_DIR, "pet.ico")
+if not os.path.exists(ICON_PATH):
+    ICON_PATH = os.path.join(ASSETS_DIR, "pet.png")
+
 
 # ─── 主应用 ────────────────────────────────────────────────
 
@@ -55,9 +65,11 @@ class Application:
     启动顺序：
     1. DBManager       → 本地数据库
     2. WeatherService  → 天气查询服务（免费 API）
-    3. QApplication    → Qt 应用
-    4. PetWindow       → 桌面宠物 UI
-    5. 进入 Qt 事件循环
+    3. EventBus + PluginManager → 事件总线与插件系统
+    4. QApplication    → Qt 应用
+    5. PetWindow       → 桌面宠物 UI
+    6. SystemMonitor   → 后台系统监控线程（事件驱动 UI 气泡）
+    7. 进入 Qt 事件循环
     """
 
     def __init__(self):
@@ -70,31 +82,62 @@ class Application:
         # 3. 天气服务（免费 wttr.in API，无需 Key）
         self.weather_service = WeatherService(db=self.db)
 
-        # 4. Qt 应用
-        self.qt_app = QApplication(sys.argv)
+        # 4. 事件总线 + 插件系统（扫描 plugins/ 目录，注册 /天气 等命令）
+        self.bus = EventBus()
+        self.plugin_manager = PluginManager(self.bus, plugins_dir="plugins")
+        self.plugin_manager.load_plugins()
 
-        # 5. 桌面宠物 UI
-        self.pet = PetWindow(self.db, self.weather_service, self.ui_config)
+        # 5. Qt 应用（设置应用级图标，对话框标题栏 / Alt+Tab 均使用宠物形象）
+        self.qt_app = QApplication(sys.argv)
+        self.qt_app.setWindowIcon(QIcon(ICON_PATH))
+
+        # 6. 桌面宠物 UI
+        self.pet = PetWindow(self.db, self.weather_service, self.ui_config,
+                             plugin_manager=self.plugin_manager)
+
+        # 7. 后台系统监控线程（采集 CPU/内存/磁盘/网络，超阈值时弹气泡）
+        self.monitor = SystemMonitor(MonitorConfig(), self.bus)
+        self.bus.on("monitor.cpu_high", self._on_cpu_high)
+        self.bus.on("monitor.mem_high", self._on_mem_high)
+
+    # ── 系统监控事件回调 ──────────────────────────────
+
+    def _on_cpu_high(self, event):
+        """CPU 持续高负载时提醒（监控线程有 10 秒冷却去抖）"""
+        cpu = event.data.get("cpu", 0)
+        self.pet.set_state("alert", 10000)   # 晕乎乎表情
+        self.pet.show_bubble(f"⚠️ CPU 占用较高（{cpu}%）\n要不要关掉一些程序？", 6000)
+
+    def _on_mem_high(self, event):
+        """内存持续高负载时提醒"""
+        mem = event.data.get("mem", 0)
+        self.pet.set_state("alert", 10000)
+        self.pet.show_bubble(f"⚠️ 内存占用较高（{mem}%）\n注意及时释放内存哦", 6000)
 
     def run(self) -> int:
         """启动应用，进入事件循环"""
         print("[App] 正在启动...")
 
         self.pet.show()
+        self.monitor.start()
 
-        pet_name = self.db.get("pet_name", "小智")
+        pet_name = self.db.get("pet_name", "小d")
+        self.pet.set_state("greet", 10000)   # 举手打招呼
         self.pet.show_bubble(
             f"你好！我是{pet_name}～\n"
             f"🖱️ 单击：AI 对话\n"
-            f"🖱️ 双击：问候\n"
+            f"🖱️ 双击：天气\n"
             f"🖱️ 右键：菜单\n"
-            f"🌤️ 右键可查天气",
+            f"⌨️ 对话中可用 /天气 北京 等命令",
             10000,
         )
 
         print("[App] 启动完成，进入事件循环")
         exit_code = self.qt_app.exec()
 
+        # 退出清理
+        self.monitor.stop()
+        self.plugin_manager.teardown_all()
         print("[App] 已退出")
         return exit_code
 

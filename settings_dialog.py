@@ -3,20 +3,16 @@
 提供 API 配置、城市设置等界面。
 支持多 AI 模型切换：DeepSeek、OpenAI、豆包、通义千问、Kimi
 
-交互方式：
-- 左键单击 → 查询天气
-- 左键双击 → 打开设置对话框
-- 右键菜单 → 更多选项
+调用方式：
+    由主窗口 PetWindow 的右键菜单「⚙️ 设置」打开：SettingsDialog(db).exec()
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QDialog, QFormLayout, QHBoxLayout, QTabWidget, QWidget,
+    QDialog, QHBoxLayout, QTabWidget, QWidget,
     QLineEdit, QPushButton, QLabel, QMessageBox, QVBoxLayout,
-    QComboBox, QRadioButton, QButtonGroup, QFrame, QSizePolicy,
-    QGraphicsDropShadowEffect,
+    QComboBox, QRadioButton, QButtonGroup, QFrame,
 )
 
 from db_manager import DBManager
@@ -292,6 +288,7 @@ class HelpFrame(QFrame):
         """)
         text_label.setWordWrap(True)
         layout.addWidget(text_label, 1)
+        self.text_label = text_label  # 供外部直接更新文案
 
 
 class PrimaryButton(QPushButton):
@@ -626,15 +623,12 @@ class SettingsDialog(QDialog):
         self.api_url_input.setPlaceholderText(config["default_url"])
 
         # 更新帮助文本
-        help_text = (
-            f"📌 注册地址：{config['help_url']}\n"
-            f"{config['help_text']}"
-        )
-        # 更新帮助框内容
-        for child in self.help_frame.findChildren(QLabel):
-            if child.text() and not child.text().startswith("📌"):
-                child.setText(help_text)
-                break
+        if is_free or not config["help_url"]:
+            self.help_frame.text_label.setText(f"💡 {config['help_text']}")
+        else:
+            self.help_frame.text_label.setText(
+                f"📌 注册地址：{config['help_url']}\n{config['help_text']}"
+            )
 
         # 免费模型禁用输入框
         self.api_key_input.setEnabled(not is_free)
@@ -671,9 +665,12 @@ class SettingsDialog(QDialog):
         current_city = self.db.get("city", "")
         self.city_input.setText(current_city)
 
-        # API 设置 - 加载当前选中模型的配置
-        current_model = self.model_combo.currentText()
-        self._on_model_changed(current_model)
+        # AI 模型：恢复上次保存的选择（否则保存时会把模型静默重置为第一项）
+        saved_model = self.db.get("current_ai_model", "本地对话 (免费)")
+        if saved_model in AI_MODELS:
+            self.model_combo.setCurrentText(saved_model)  # 触发 _on_model_changed
+        else:
+            self._on_model_changed(self.model_combo.currentText())
 
     # ── 保存 ────────────────────────────────────────
 
@@ -690,12 +687,16 @@ class SettingsDialog(QDialog):
         current_model = self.model_combo.currentText()
         model_key = current_model.split(" ")[0].lower()
 
-        api_key = self.api_key_input.text().strip()
-        api_url = self.api_url_input.text().strip()
-
-        self.db.set(f"{model_key}_api_key", api_key)
-        if api_url:
-            self.db.set(f"{model_key}_api_url", api_url)
+        if AI_MODELS[current_model]["is_free"]:
+            # 免费模型无需 API 配置，顺手清掉历史遗留的空键
+            self.db.delete(f"{model_key}_api_key")
+            self.db.delete(f"{model_key}_api_url")
+        else:
+            api_key = self.api_key_input.text().strip()
+            api_url = self.api_url_input.text().strip()
+            self.db.set(f"{model_key}_api_key", api_key)
+            if api_url:
+                self.db.set(f"{model_key}_api_url", api_url)
 
         # 保存当前选中的模型
         self.db.set("current_ai_model", current_model)

@@ -3,23 +3,46 @@
 基于 PyQt6 实现透明无边框窗口、图片宠物、拖拽移动、天气气泡。
 
 交互方式：
-- 左键拖拽：移动宠物位置
-- 左键单击：查询天气 + 显示地址
-- 左键双击：打开设置对话框（API 配置、城市设置）
-- 右键单击：弹出菜单（退出、设置、关于）
+- 左键单击：打开 AI 对话窗口
+- 左键双击：查询天气 + 出行建议（气泡显示）
+- 左键拖拽：移动宠物位置，松手即保存
+- 右键单击：菜单（AI 对话 / 查询天气 / 系统状态 / 设置 / 退出）
+
+实现要点：
+天气气泡是独立顶层窗口而非子控件 —— Qt 会将子控件裁剪到父窗口
+矩形内，而气泡需显示在宠物窗口上方，做成子控件会完全不可见。
 """
 from __future__ import annotations
 
 import os
 from PyQt6.QtCore import QPoint, Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPixmap
-from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QWidget
+from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
 from db_manager import DBManager
 from settings_dialog import SettingsDialog
 from chat_dialog import ChatDialog
 from weather_service import WeatherService
 from system_status import SystemStatus
+
+
+# ─── 宠物形象状态表 ────────────────────────────────────────
+# 状态名 -> (中文说明, 图片文件, 缩放系数)
+# 图片放在 assets/states/ 下，均为透明背景的鲸鱼少女立绘。
+# 缩放系数用于微调各状态在窗口里的相对大小（立绘远近不同）。
+PET_STATES: dict[str, tuple[str, str, float]] = {
+    # 第 3 列是缩放系数：全身立绘铺满窗口，面部特写缩小一点，
+    # 这样切换表情时不会忽大忽小地跳。可按喜好自行调整。
+    "idle":    ("待机",     "idle.png",    0.90),
+    "greet":   ("打招呼",   "greet.png",   1.00),
+    "chat":    ("对话中",   "chat.png",    0.90),
+    "weather": ("查天气",   "weather.png", 1.00),
+    "status":  ("系统状态", "status.png",  0.90),
+    "alert":   ("高负载",   "alert.png",   0.90),
+    "happy":   ("开心",     "happy.png",   1.00),
+}
+
+STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "states")
 
 
 # ─── 天气查询线程 ──────────────────────────────────────────
@@ -43,10 +66,15 @@ class WeatherBubble(QWidget):
     """
     天气信息气泡，显示在宠物旁边。
     半透明圆角矩形，自动隐藏。
+
+    实现要点：
+    必须做成【独立顶层窗口】而非 PetWindow 的子控件。
+    因为 Qt 会把子控件裁剪到父窗口范围内，而气泡需要显示在
+    宠物窗口上方（父窗口矩形之外），作为子控件时会被整个裁掉、完全不可见。
     """
 
-    def __init__(self, parent: QWidget, ui_config):
-        super().__init__(parent)
+    def __init__(self, ui_config):
+        super().__init__(None)  # 顶层窗口，无父控件
         self.ui_config = ui_config
         self._text = ""
         self._opacity = 0.0
@@ -54,12 +82,26 @@ class WeatherBubble(QWidget):
         self._fading_out = False
         self._fade_out_timer = None  # 淡出定时器
 
-        self._fade_timer = QTimer(self)
-        self._fade_timer.timeout.connect(self._fade_step)
-
+        # 顶层窗口标志：
+        # Tool                    — 不在任务栏显示
+        # FramelessWindowHint     — 无边框
+        # WindowStaysOnTopHint    — 置顶
+        # WindowDoesNotAcceptFocus— 不抢焦点（不影响用户正在操作的窗口）
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         # 鼠标穿透：气泡不拦截点击
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setFixedWidth(self.ui_config.bubble_max_width)
+
+        # 淡出动画定时器
+        self._fade_timer = QTimer(self)
+        self._fade_timer.timeout.connect(self._fade_step)
 
     def show_weather(self, data: dict, duration_ms: int = 8000):
         """格式化并显示天气信息"""
@@ -73,10 +115,10 @@ class WeatherBubble(QWidget):
                 f"💧 湿度 {data['humidity']}%\n"
                 f"\n💡 {data['advice']}"
             )
-        self._show_text(text, duration_ms)
+        self.show_text(text, duration_ms)
 
-    def _show_text(self, text: str, duration_ms: int):
-        """显示文本气泡"""
+    def show_text(self, text: str, duration_ms: int):
+        """显示文本气泡（自动调整尺寸、置顶、定时淡出）"""
         # 取消之前的淡出定时器
         if self._fade_out_timer:
             self._fade_out_timer.stop()
@@ -89,6 +131,9 @@ class WeatherBubble(QWidget):
         self._fade_timer.stop()
         self._adjust_size()
         self.update()
+        # 顶层窗口需显式显示并置顶，否则不会绘制
+        self.show()
+        self.raise_()
 
         # 创建新的淡出定时器
         self._fade_out_timer = QTimer()
@@ -123,7 +168,19 @@ class WeatherBubble(QWidget):
             self._visible = False
             self._fading_out = False
             self._fade_timer.stop()
+            self.hide()  # 顶层窗口需要显式隐藏
         self.update()
+
+    def hide_bubble(self):
+        """立即隐藏气泡并停止所有定时器"""
+        if self._fade_out_timer:
+            self._fade_out_timer.stop()
+            self._fade_out_timer = None
+        self._fade_timer.stop()
+        self._opacity = 0.0
+        self._visible = False
+        self._fading_out = False
+        self.hide()
 
     def paintEvent(self, event):
         if not self._visible or self._opacity <= 0:
@@ -155,17 +212,19 @@ class PetWindow(QWidget):
     桌面宠物主窗口。
 
     交互方式：
-    - 左键拖拽 → 移动
-    - 左键单击 → 查询天气 + 地址
-    - 左键双击 → 打开设置对话框
-    - 右键菜单 → 退出 / 设置 / 关于
+    - 左键单击 → 打开 AI 对话窗口
+    - 左键双击 → 查询天气 + 出行建议
+    - 左键拖拽 → 移动（松手保存位置）
+    - 右键菜单 → 对话 / 天气 / 系统状态 / 设置 / 退出
     """
 
-    def __init__(self, db: DBManager, weather_service: WeatherService, ui_config):
+    def __init__(self, db: DBManager, weather_service: WeatherService, ui_config,
+                 plugin_manager=None):
         super().__init__()
         self.db = db
         self.weather_service = weather_service
         self.ui_config = ui_config
+        self.plugin_manager = plugin_manager  # 传入对话窗口，支持 /命令
         self._weather_worker: WeatherWorker | None = None
 
         # 拖拽状态
@@ -177,46 +236,111 @@ class PetWindow(QWidget):
         # 双击检测
         self._last_click_time = 0
 
-        # 加载宠物图片
-        self._pet_pixmap = self._load_pet_image()
+        # 加载全部状态立绘，默认待机
+        self._pet_pixmaps = self._load_pet_images()
+        self._state = "idle"
+
+        # 状态自动回退定时器（如"查天气"表情维持几秒后回到待机）
+        self._revert_timer = QTimer(self)
+        self._revert_timer.setSingleShot(True)
+        self._revert_timer.timeout.connect(lambda: self.set_state("idle"))
 
         # 初始化窗口
         self._init_window()
 
-        # 天气气泡
-        self.bubble = WeatherBubble(self, ui_config)
-        self._position_bubble()
+        # 天气气泡（独立顶层窗口，不随宠物窗口被裁剪）
+        self.bubble = WeatherBubble(ui_config)
+
+        # 订阅事件总线：对话回复完成 → 开心表情；插件也可通过 pet.state 事件切换形象
+        if plugin_manager is not None:
+            bus = plugin_manager.bus
+            bus.on("chat.reply", lambda e: self.set_state("happy", 4000))
+            bus.on("pet.state", lambda e: self.set_state(
+                e.data.get("state", "idle"), e.data.get("revert_after_ms", 0)))
 
     # ── 图片加载 ──────────────────────────────────
 
-    def _load_pet_image(self) -> QPixmap:
-        """加载宠物图片，按配置尺寸缩放"""
-        img_path = self.db.get("pet_image", r"E:\毕业设计\shuchaiku\nv.png")
-        if not os.path.isabs(img_path):
-            img_path = os.path.join(os.path.dirname(__file__), img_path)
-
+    def _placeholder_pixmap(self) -> QPixmap:
+        """所有立绘都加载失败时的兜底占位图（青色圆）"""
         width = int(self.db.get("pet_width", "200"))
         height = int(self.db.get("pet_height", "200"))
+        pixmap = QPixmap(width, height)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        from PyQt6.QtGui import QBrush, QPen
+        painter.setBrush(QBrush(QColor("#4ecdc4")))
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.drawEllipse(10, 10, width - 20, height - 20)
+        painter.end()
+        return pixmap
 
-        pixmap = QPixmap(img_path)
-        if pixmap.isNull():
-            print(f"[Pet] ⚠️ 图片加载失败: {img_path}，使用默认占位图")
-            pixmap = QPixmap(width, height)
-            pixmap.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            from PyQt6.QtGui import QBrush, QPen
-            painter.setBrush(QBrush(QColor("#4ecdc4")))
-            painter.setPen(QPen(QColor("#ffffff"), 2))
-            painter.drawEllipse(10, 10, width - 20, height - 20)
-            painter.end()
-        else:
-            pixmap = pixmap.scaled(
-                width, height,
+    def _load_pet_images(self) -> dict[str, QPixmap]:
+        """
+        加载全部状态的宠物立绘，返回 {状态名: QPixmap}。
+
+        图片来自 assets/states/（相对项目路径，换台电脑也能用）。
+        若数据库 pet_image 指定了自定义图片，则所有状态都用它，
+        方便只想换一张图、不想准备整套立绘的场景。
+        """
+        width = int(self.db.get("pet_width", "200"))
+        height = int(self.db.get("pet_height", "200"))
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+
+        def fit(pm: QPixmap, scale: float) -> QPixmap:
+            return pm.scaled(
+                int(width * scale), int(height * scale),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-        return pixmap
+
+        # 自定义单图：所有状态共用
+        custom = self.db.get("pet_image", "")
+        if custom:
+            path = custom if os.path.isabs(custom) else os.path.join(project_dir, custom)
+            pm = QPixmap(path)
+            if not pm.isNull():
+                print(f"[Pet] 使用自定义形象: {path}")
+                return {key: fit(pm, 1.0) for key in PET_STATES}
+            print(f"[Pet] ⚠️ 自定义形象加载失败: {path}")
+
+        pixmaps: dict[str, QPixmap] = {}
+        for key, (label, filename, scale) in PET_STATES.items():
+            pm = QPixmap(os.path.join(STATE_DIR, filename))
+            if pm.isNull():
+                print(f"[Pet] ⚠️ 状态立绘缺失: {filename}（{label}）")
+                continue
+            pixmaps[key] = fit(pm, scale)
+
+        if not pixmaps:
+            print("[Pet] ⚠️ 未找到任何状态立绘，使用占位图")
+            pixmaps["idle"] = self._placeholder_pixmap()
+        elif "idle" not in pixmaps:
+            pixmaps["idle"] = next(iter(pixmaps.values()))
+        return pixmaps
+
+    # ── 状态切换 ──────────────────────────────────
+
+    def set_state(self, state: str, revert_after_ms: int = 0):
+        """
+        切换宠物形象。
+
+        state           —— PET_STATES 中的状态名
+        revert_after_ms —— >0 时，指定毫秒后自动回到 idle
+        """
+        if state not in self._pet_pixmaps:
+            return
+        self._revert_timer.stop()
+        if state != self._state:
+            self._state = state
+            self.update()
+        if revert_after_ms > 0 and state != "idle":
+            self._revert_timer.start(revert_after_ms)
+
+    @property
+    def state(self) -> str:
+        """当前状态名"""
+        return self._state
 
     # ── 窗口初始化 ────────────────────────────────
 
@@ -246,9 +370,11 @@ class PetWindow(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        x = (self.width() - self._pet_pixmap.width()) // 2
-        y = (self.height() - self._pet_pixmap.height()) // 2
-        painter.drawPixmap(x, y, self._pet_pixmap)
+        pixmap = self._pet_pixmaps.get(self._state) or self._pet_pixmaps["idle"]
+        # 水平居中、底边对齐：各状态共用同一条"地面线"，切换时不会上下跳
+        x = (self.width() - pixmap.width()) // 2
+        y = self.height() - pixmap.height()
+        painter.drawPixmap(x, y, pixmap)
         painter.end()
 
     # ── 鼠标事件 ──────────────────────────────────
@@ -271,10 +397,16 @@ class PetWindow(QWidget):
             if self._dragging:
                 new_pos = current_pos - self._drag_start_pos
                 self.move(new_pos)
+                # 气泡是独立窗口，拖动时需跟随宠物
+                if self.bubble.isVisible():
+                    self._position_bubble()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            if not self._dragging:
+            if self._dragging:
+                # 拖拽结束立即持久化位置，避免异常退出时丢失
+                self._save_position()
+            else:
                 self._handle_click()
             self._dragging = False
 
@@ -387,6 +519,7 @@ class PetWindow(QWidget):
             except:
                 pass
 
+        self.set_state("weather", 15000)
         self.show_bubble("正在查询天气...", 3000)
 
         self._weather_worker = WeatherWorker(self.weather_service)
@@ -398,19 +531,19 @@ class PetWindow(QWidget):
         if data.get("error"):
             self.show_bubble(f"天气查询失败: {data['error']}", 5000)
         else:
-            # 显示天气信息气泡
+            # 先填充内容（尺寸随文字变化），再定位
             self.bubble.show_weather(data, duration_ms=15000)
             self._position_bubble()
-            # 确保气泡可见
-            self.bubble.show()
-            self.bubble.raise_()
 
     # ── 对话窗口 ──────────────────────────────────
 
     def _open_chat(self):
         """打开对话窗口"""
-        dlg = ChatDialog(self.db, self)
+        self.set_state("chat", 3000)
+        dlg = ChatDialog(self.db, self, plugin_manager=self.plugin_manager)
         dlg.exec()
+        # 对话窗口关闭后回到待机
+        self.set_state("idle")
 
     # ── 随机问候（含天气） ──────────────────────────
 
@@ -423,6 +556,7 @@ class PetWindow(QWidget):
 
     def _show_system_status(self):
         """显示系统状态"""
+        self.set_state("status", 10000)
         status_text = SystemStatus.get_status_summary()
         self.show_bubble(status_text, 8000)
 
@@ -435,48 +569,47 @@ class PetWindow(QWidget):
 
     # ── 退出 ──────────────────────────────────────
 
-    def _quit_app(self):
-        """保存窗口位置并退出"""
+    def _save_position(self):
+        """把当前窗口位置写入数据库"""
         pos = self.pos()
         self.db.set("window_x", str(pos.x()))
         self.db.set("window_y", str(pos.y()))
+
+    def _quit_app(self):
+        """保存窗口位置并退出"""
+        self._save_position()
+        self.bubble.hide_bubble()
         QApplication.quit()
+
+    def closeEvent(self, event):
+        """关闭主窗口时一并收起气泡顶层窗口"""
+        self.bubble.hide_bubble()
+        super().closeEvent(event)
 
     # ── 气泡定位 ──────────────────────────────────
 
     def _position_bubble(self):
-        """将气泡定位在宠物上方（本地坐标系）"""
+        """
+        将气泡定位在宠物上方（全局屏幕坐标）。
+
+        气泡是独立顶层窗口，因此这里全部使用屏幕绝对坐标；
+        若上方空间不足则翻转到宠物下方，左右也做边界收敛。
+        """
+        screen = QApplication.primaryScreen().availableGeometry()
         bubble_width = self.bubble.width()
         bubble_height = self.bubble.height()
-        pet_width = self.width()
-        pet_height = self.height()
+        pet_rect = self.frameGeometry()
 
         # 水平居中对齐宠物
-        bx = (pet_width - bubble_width) // 2
+        bx = pet_rect.center().x() - bubble_width // 2
 
-        # 垂直方向：在宠物上方
-        by = -bubble_height - 10
+        # 垂直方向：优先显示在宠物上方，空间不足则改到下方
+        by = pet_rect.top() - bubble_height - 10
+        if by < screen.top():
+            by = pet_rect.bottom() + 10
 
-        # 边界检查（全部使用屏幕全局坐标）
-        screen = QApplication.primaryScreen().geometry()
-        pet_x = self.x()
-        pet_y = self.y()
-
-        # 气泡屏幕坐标
-        bubble_screen_x = pet_x + bx
-        bubble_screen_y = pet_y + by
-
-        # 如果气泡超出屏幕上方，改为显示在宠物下方
-        if bubble_screen_y < 0:
-            by = pet_height + 10
-
-        # 如果气泡超出屏幕右侧，向左调整
-        if bubble_screen_x + bubble_width > screen.width():
-            bx = pet_width - bubble_width - 10
-
-        # 如果气泡超出屏幕左侧，向右调整
-        if bubble_screen_x < 0:
-            bx = 10
+        # 左右边界收敛
+        bx = max(screen.left(), min(bx, screen.right() - bubble_width))
 
         self.bubble.move(bx, by)
 
@@ -484,7 +617,5 @@ class PetWindow(QWidget):
 
     def show_bubble(self, text: str, duration_ms: int = 5000):
         """显示简单文本气泡"""
-        self.bubble._show_text(text, duration_ms)
+        self.bubble.show_text(text, duration_ms)
         self._position_bubble()
-        self.bubble.show()
-        self.bubble.raise_()
