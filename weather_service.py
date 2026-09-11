@@ -1,118 +1,175 @@
 """
 天气服务模块
-调用 OpenWeatherMap API 获取实时天气，并生成出行建议。
+使用 wttr.in 免费开源天气 API，无需 API Key。
+https://github.com/chubin/wttr.in
 """
 from __future__ import annotations
 
+import json
+import re
 import requests
+
+from db_manager import DBManager
 
 
 class WeatherService:
     """
     天气查询服务。
 
-    使用 OpenWeatherMap 免费 API：
-    https://api.openweathermap.org/data/2.5/weather
+    使用 wttr.in 免费 API（无需 API Key）：
+    https://wttr.in/{city}?format=j1
 
-    参数：
-        api_key: OpenWeatherMap API Key
-        city:    查询城市名（中文或英文均可，如 "Beijing" 或 "上海"）
-                 留空则自动通过 IP 定位获取当前城市
-        lang:    返回语言，默认 zh_cn（简体中文）
-        units:   温度单位，metric=摄氏度
+    也支持通过 ip-api.com 自动定位城市。
     """
 
-    # 免费 IP 地理定位服务（无需 API Key）
-    _GEO_API = "http://ip-api.com/json/?lang=zh-CN&fields=status,country,city"
+    # wttr.in JSON API（完全免费，无需注册）
+    _WTTR_API = "https://wttr.in/{city}?format=j1&lang=zh"
+    # IP 地理定位 API 列表（按优先级排列）
+    _GEO_APIS = [
+        {"url": "http://ip-api.com/json/?lang=zh-CN&fields=status,country,city", "timeout": 3},
+        {"url": "https://ipapi.co/json/", "timeout": 3},
+        {"url": "https://ipinfo.io/json", "timeout": 3},
+        {"url": "https://ip.seeip.org/jsonip?", "timeout": 3},
+    ]
 
-    def __init__(self, api_key: str, city: str = "", lang: str = "zh_cn"):
-        self.api_key = api_key
-        self.city = city
-        self.lang = lang
-        self._auto_city: str | None = None  # 缓存自动定位的城市
+    def __init__(self, db: DBManager):
+        self.db = db
+        self._auto_city: dict | None = None  # {"cn": "成都", "en": "Chengdu"}
+
+    @property
+    def city(self) -> str:
+        """从数据库读取城市设置（英文，用于 API 查询）"""
+        return self.db.get("city", "")
+
+    # 中文城市名映射（ip-api 返回中文，wttr.in 需要英文）
+    _CITY_CN_TO_EN = {
+        "成都": "Chengdu", "北京": "Beijing", "上海": "Shanghai",
+        "广州": "Guangzhou", "深圳": "Shenzhen", "杭州": "Hangzhou",
+        "武汉": "Wuhan", "南京": "Nanjing", "重庆": "Chongqing",
+        "西安": "Xian", "天津": "Tianjin", "苏州": "Suzhou",
+        "郑州": "Zhengzhou", "长沙": "Changsha", "东莞": "Dongguan",
+        "沈阳": "Shenyang", "青岛": "Qingdao", "合肥": "Hefei",
+        "佛山": "Foshan", "宁波": "Ningbo", "昆明": "Kunming",
+        "大连": "Dalian", "福州": "Fuzhou", "厦门": "Xiamen",
+        "哈尔滨": "Harbin", "济南": "Jinan", "温州": "Wenzhou",
+        "南宁": "Nanning", "长春": "Changchun", "泉州": "Quanzhou",
+        "石家庄": "Shijiazhuang", "贵阳": "Guiyang", "南昌": "Nanchang",
+        "太原": "Taiyuan", "烟台": "Yantai", "嘉兴": "Jiaxing",
+        "珠海": "Zhuhai", "惠州": "Huizhou", "徐州": "Xuzhou",
+        "海口": "Haikou", "乌鲁木齐": "Urumqi", "中山": "Zhongshan",
+        "兰州": "Lanzhou", "台州": "Taizhou", "桂林": "Guilin",
+    }
 
     @staticmethod
-    def detect_city() -> str:
+    def detect_city() -> dict:
         """
-        通过 IP 地理定位自动获取当前城市。
-        使用 ip-api.com 免费服务，无需 API Key。
+        通过 IP 自动定位当前城市。
+        依次尝试多个 API，返回 {"cn": "成都", "en": "Chengdu"}
         """
-        try:
-            resp = requests.get(
-                WeatherService._GEO_API,
-                timeout=5,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("status") == "success":
-                city = data.get("city", "")
-                if city:
-                    print(f"[Weather] IP 定位成功: {city}")
-                    return city
-            print("[Weather] IP 定位返回失败状态")
-            return ""
-        except requests.RequestException as e:
-            print(f"[Weather] IP 定位失败: {e}")
-            return ""
+        for i, api in enumerate(WeatherService._GEO_APIS):
+            try:
+                resp = requests.get(api["url"], timeout=api["timeout"])
+                resp.raise_for_status()
+                data = resp.json()
 
-    def _resolve_city(self) -> str:
-        """获取要查询的城市名：优先使用配置值，否则自动定位"""
+                # ip-api.com 格式（返回中文城市名）
+                if data.get("status") == "success":
+                    city_cn = data.get("city", "")
+                    if city_cn:
+                        print(f"[Weather] IP 定位成功（API{i+1}）: {city_cn}")
+                        city_en = WeatherService._CITY_CN_TO_EN.get(city_cn, city_cn)
+                        return {"cn": city_cn, "en": city_en}
+
+                # ipinfo.io / ipapi.co 格式
+                city_en = data.get("city", "")
+                if city_en:
+                    # 反查中文名
+                    city_cn = city_en
+                    for cn, en in WeatherService._CITY_CN_TO_EN.items():
+                        if en.lower() == city_en.lower():
+                            city_cn = cn
+                            break
+                    print(f"[Weather] IP 定位成功（API{i+1}）: {city_cn}")
+                    return {"cn": city_cn, "en": city_en}
+
+            except Exception as e:
+                print(f"[Weather] API{i+1} 定位失败: {e}")
+                continue
+
+        return {"cn": "", "en": ""}
+
+    def _resolve_city(self) -> dict:
+        """
+        获取城市信息：优先数据库设置，否则自动定位。
+        返回 {"cn": "成都", "en": "Chengdu"}
+        """
         if self.city:
-            return self.city
-        # 首次自动定位，结果缓存
+            city_en = self.city
+            city_cn = self._CITY_CN_TO_EN.get(city_en, city_en)
+            # 反查：如果用户输入的是中文
+            for cn, en in self._CITY_CN_TO_EN.items():
+                if en.lower() == city_en.lower() or cn == city_en:
+                    return {"cn": cn, "en": en}
+            return {"cn": city_en, "en": city_en}
+
         if self._auto_city is None:
             self._auto_city = self.detect_city()
-        return self._auto_city or "Beijing"
+
+        if self._auto_city and self._auto_city.get("en"):
+            return self._auto_city
+        return {"cn": "北京", "en": "Beijing"}
 
     def fetch(self) -> dict:
         """
-        请求天气 API，返回解析后的结果字典。
+        请求 wttr.in 天气 API，返回解析后的结果字典。
 
         返回结构：
         {
-            "city":       str,   # 城市名
-            "temp":       float, # 当前温度（℃）
-            "feels_like": float, # 体感温度（℃）
-            "humidity":   int,   # 湿度 %
-            "description": str,  # 天气描述，如"多云"
-            "advice":     str,   # 出行建议
+            "city":       str,   # 中文城市名
+            "temp":       float,
+            "feels_like": float,
+            "humidity":   int,
+            "description": str,  # 中文天气描述
+            "advice":     str,
             "error":      str | None
         }
         """
-        if not self.api_key:
-            return self._fallback("未配置 API Key，请在 config.py 中填写。")
+        city_info = self._resolve_city()
+        city_en = city_info["en"]
+        city_cn = city_info["cn"]
 
-        city = self._resolve_city()
-        if not city:
+        if not city_en:
             return self._fallback("无法获取城市信息，请检查网络或手动配置城市。")
 
         try:
-            resp = requests.get(
-                "https://api.openweathermap.org/data/2.5/weather",
-                params={
-                    "q": city,
-                    "appid": self.api_key,
-                    "units": "metric",
-                    "lang": self.lang,
-                },
-                timeout=8,
-            )
+            url = self._WTTR_API.format(city=city_en)
+            resp = requests.get(url, timeout=10, headers={"Accept-Language": "zh-CN"})
             resp.raise_for_status()
             data = resp.json()
 
-            weather = data.get("weather", [{}])[0]
-            main = data.get("main", {})
+            current = data.get("current_condition", [{}])[0]
+            temp = float(current.get("temp_C", 0))
+            feels_like = float(current.get("FeelsLikeC", 0))
+            humidity = int(current.get("humidity", 0))
 
-            temp = round(main.get("temp", 0), 1)
-            feels_like = round(main.get("feels_like", 0), 1)
-            humidity = main.get("humidity", 0)
-            description = weather.get("description", "未知")
-            weather_main = weather.get("main", "")
+            # 获取天气描述并翻译为中文
+            raw_desc = ""
+            # 尝试 lang_zh
+            desc_zh = current.get("lang_zh", [])
+            if isinstance(desc_zh, list) and desc_zh:
+                raw_desc = desc_zh[0].get("value", "").strip()
+            # 如果 lang_zh 为空，用 weatherDesc
+            if not raw_desc:
+                desc_en = current.get("weatherDesc", [{}])
+                if isinstance(desc_en, list) and desc_en:
+                    raw_desc = desc_en[0].get("value", "").strip()
+            # 翻译为中文（wttr.in 的 lang_zh 经常返回英文）
+            description = self._translate_weather_desc(raw_desc) if raw_desc else "未知"
 
-            advice = self._generate_advice(temp, description, weather_main, humidity)
+            advice = self._generate_advice(temp, description, humidity)
 
             return {
-                "city": data.get("name", city),
+                "city": city_cn,
                 "temp": temp,
                 "feels_like": feels_like,
                 "humidity": humidity,
@@ -126,51 +183,70 @@ class WeatherService:
         except (KeyError, IndexError, ValueError) as e:
             return self._fallback(f"数据解析失败: {e}")
 
+    @staticmethod
+    def _translate_weather_desc(en_desc: str) -> str:
+        """简单英译中天气描述（长匹配优先）"""
+        desc = en_desc.strip()
+        # 按长度降序排列，确保更具体的描述优先匹配
+        mapping = [
+            ("Torrential rain shower", "暴雨"),
+            ("Moderate or heavy rain shower", "大阵雨"),
+            ("Thundery outbreaks possible", "可能有雷阵雨"),
+            ("Patchy rain possible", "可能有零星小雨"),
+            ("Patchy rain nearby", "附近有零星小雨"),
+            ("Light rain shower", "阵雨"),
+            ("Heavy rain", "大雨"),
+            ("Moderate rain", "中雨"),
+            ("Light drizzle", "毛毛雨"),
+            ("Light rain", "小雨"),
+            ("Heavy snow", "大雪"),
+            ("Moderate snow", "中雪"),
+            ("Light snow", "小雪"),
+            ("Partly cloudy", "多云"),
+            ("Thunderstorm", "雷暴"),
+            ("Blizzard", "暴风雪"),
+            ("Overcast", "阴天"),
+            ("Cloudy", "多云"),
+            ("Sunny", "晴天"),
+            ("Clear", "晴朗"),
+            ("Mist", "薄雾"),
+            ("Fog", "雾"),
+            ("Haze", "霾"),
+        ]
+        for en, zh in mapping:
+            if en.lower() in desc.lower():
+                return zh
+        return desc
+
     # ── 出行建议生成 ──────────────────────────────
 
     @staticmethod
-    def _generate_advice(temp: float, desc: str, weather_main: str, humidity: int) -> str:
-        """根据天气状况生成一句出行建议"""
+    def _generate_advice(temp: float, desc: str, humidity: int) -> str:
+        """根据天气状况生成出行建议"""
         desc_lower = desc.lower()
-        main_lower = weather_main.lower()
 
-        # 降水类
         if any(k in desc_lower for k in ("雨", "rain", "shower", "drizzle")):
             return "今天有雨，记得带伞哦！☂️"
         if any(k in desc_lower for k in ("雪", "snow", "sleet")):
-            return "下雪了，路面湿滑，注意保暖和出行安全！🧣"
+            return "下雪了，路面湿滑，注意保暖！🧣"
         if any(k in desc_lower for k in ("雷", "thunder", "storm")):
-            return "雷暴天气，尽量待在室内，远离空旷地带！⚡"
-
-        # 极端温度
+            return "雷暴天气，尽量待在室内！⚡"
         if temp >= 38:
-            return "高温预警！尽量避免外出，注意防暑降温！🥵"
+            return "高温预警！注意防暑降温！🥵"
         if temp >= 33:
-            return "天气炎热，多喝水，外出注意防晒！🧴"
+            return "天气炎热，多喝水，注意防晒！🧴"
         if temp <= 0:
-            return "气温在冰点以下，注意保暖，外出穿厚外套！❄️"
+            return "气温在冰点以下，注意保暖！❄️"
         if temp <= 5:
             return "天气较冷，记得添衣保暖！🧥"
-
-        # 能见度
         if any(k in desc_lower for k in ("雾", "fog", "mist", "haze", "霾")):
-            return "能见度低，开车注意安全，建议戴口罩出行。😷"
-
-        # 晴天紫外线
+            return "能见度低，注意安全，建议戴口罩。😷"
         if any(k in desc_lower for k in ("晴", "clear", "sunny")):
-            if temp > 25:
-                return "天气晴好，紫外线可能较强，注意防晒！☀️"
-            return "天气不错，适合外出活动！🌤️"
-
-        # 多云
+            return "天气晴好，适合外出活动！☀️" if temp > 25 else "天气不错！🌤️"
         if any(k in desc_lower for k in ("云", "cloud", "overcast", "阴")):
-            return "多云天气，适合散步，不会太晒也不会太冷。🙂"
-
-        # 湿度
+            return "多云天气，适合散步。🙂"
         if humidity >= 85:
-            return "湿度较高，注意防潮，衣物可能不容易干。💧"
-
-        # 默认
+            return "湿度较高，注意防潮。💧"
         return "出门看看今天的风景吧！🌈"
 
     # ── 降级结果 ──────────────────────────────────
@@ -183,6 +259,6 @@ class WeatherService:
             "feels_like": 0,
             "humidity": 0,
             "description": "获取失败",
-            "advice": "无法获取天气信息，请检查网络和 API Key。",
+            "advice": "无法获取天气信息，请检查网络。",
             "error": error_msg,
         }
