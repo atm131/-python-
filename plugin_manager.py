@@ -120,11 +120,14 @@ class PluginBase:
     - name:     插件名称
     - version:  版本号
     - commands: 该插件注册的命令列表 [{"name": ..., "desc": ..., "handler": ...}]
+    - db:       共享的 DBManager（由 PluginManager 注入，未注入时为 None）。
+                声明成类属性是为了即使子类没有调用 super().__init__ 也能安全访问。
     """
 
     name: str = "unnamed_plugin"
     version: str = "0.1.0"
     description: str = ""
+    db = None  # 由 PluginManager 注入，插件不必自己新建数据库连接
 
     def __init__(self, bus: EventBus):
         self.bus = bus
@@ -171,11 +174,15 @@ class PluginManager:
         ├── weather_plugin.py    # 单文件插件
         ├── schedule_plugin.py
         └── ...
+
+    db 参数为可选的共享 DBManager：传了它，插件就能像主程序一样读设置
+    （如课程表），而不必自己新建数据库连接；不传时插件的 plugin.db 为 None。
     """
 
-    def __init__(self, bus: EventBus, plugins_dir: str = "plugins"):
+    def __init__(self, bus: EventBus, plugins_dir: str = "plugins", db=None):
         self.bus = bus
         self.plugins_dir = plugins_dir
+        self.db = db
         self.plugins: list[PluginBase] = []
         self._commands: dict[str, tuple[PluginBase, Callable]] = {}
 
@@ -209,6 +216,7 @@ class PluginManager:
                     and issubclass(attr, PluginBase)
                     and attr is not PluginBase):
                 plugin = attr(self.bus)
+                plugin.db = self.db          # 注入共享数据库（可能为 None）
                 plugin.setup()
                 self.plugins.append(plugin)
                 # 注册该插件的所有命令

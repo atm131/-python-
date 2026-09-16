@@ -1,6 +1,6 @@
 """
 设置对话框模块（现代化重写）
-提供 API 配置、城市设置等界面。
+提供 API 配置、城市设置、课程表等界面。
 支持多 AI 模型切换：DeepSeek、OpenAI、豆包、通义千问、Kimi
 
 调用方式：
@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QDialog, QHBoxLayout, QTabWidget, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QHBoxLayout,
+    QHeaderView, QTabWidget, QTableWidget, QTableWidgetItem, QWidget,
     QLineEdit, QPushButton, QLabel, QMessageBox, QVBoxLayout,
     QComboBox, QRadioButton, QButtonGroup, QFrame,
 )
 
+from course_service import CourseService
 from db_manager import DBManager
 
 
@@ -72,6 +74,16 @@ AI_MODELS = {
 }
 
 
+# ─── 课程表列定义 ─────────────────────────────────────────────
+
+# 列顺序即保存时的字段顺序，改列名时记得同步 CourseService 的字段约定
+COURSE_COLUMNS = ["课程名", "星期", "开始", "结束", "教室", "提前(分钟)", "启用"]
+COL_NAME, COL_WEEKDAY, COL_START, COL_END, COL_ROOM, COL_REMIND, COL_ENABLED = range(7)
+
+# 星期用下拉框选择，避免用户填错数字（索引 +1 即 ISO 星期）
+WEEKDAY_ITEMS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
 # ─── 样式常量 ─────────────────────────────────────────────────
 
 # 主色调
@@ -101,6 +113,16 @@ ERROR_COLOR = "#FF3B30"
 RADIUS_SMALL = 6
 RADIUS_MEDIUM = 10
 RADIUS_LARGE = 14
+
+# 卡片容器样式：城市设置 / API 配置 / 课程表三个页签共用同一套外观
+CARD_FRAME_STYLE = f"""
+    QFrame {{
+        background-color: {CARD_BG};
+        border: 1px solid {BORDER_COLOR};
+        border-radius: {RADIUS_MEDIUM}px;
+        padding: 16px;
+    }}
+"""
 
 # 全局样式表
 GLOBAL_STYLE = f"""
@@ -227,6 +249,41 @@ QRadioButton::indicator:checked {{
 QRadioButton::indicator:hover {{
     border-color: {PRIMARY_COLOR};
 }}
+
+QCheckBox {{
+    color: {TEXT_PRIMARY};
+    font-size: 13px;
+    spacing: 8px;
+}}
+
+QTableWidget {{
+    background-color: {CARD_BG};
+    alternate-background-color: {BG_COLOR};
+    border: 1px solid {BORDER_COLOR};
+    border-radius: {RADIUS_SMALL}px;
+    gridline-color: #EDEDF0;
+    font-size: 13px;
+    color: {TEXT_PRIMARY};
+}}
+
+QTableWidget::item {{
+    padding: 4px 6px;
+}}
+
+QTableWidget::item:selected {{
+    background-color: rgba(0, 122, 255, 0.12);
+    color: {TEXT_PRIMARY};
+}}
+
+QHeaderView::section {{
+    background-color: {BG_COLOR};
+    color: {TEXT_SECONDARY};
+    border: none;
+    border-bottom: 1px solid {BORDER_COLOR};
+    padding: 8px 6px;
+    font-size: 12px;
+    font-weight: 600;
+}}
 """
 
 
@@ -351,16 +408,30 @@ class SettingsDialog(QDialog):
     设置对话框，包含多个标签页：
     1. 城市设置 — 手动/自动定位
     2. API 配置 — 多 AI 模型切换
+    3. 课程表   — 录入课程，交给 CourseReminder 定时提醒
     """
 
     def __init__(self, db: DBManager, parent=None):
         super().__init__(parent)
         self.db = db
+        self.course_service = CourseService(db)
         self.setWindowTitle("⚙️ 设置")
-        self.setMinimumSize(520, 480)
+        # 课程表页签需要放下一张 8 行左右的表格，但窗口不能超出屏幕（小屏笔记本会顶到屏幕外）
+        self.setMinimumSize(*self._preferred_size())
         self._password_visible = False
         self._init_ui()
         self._load_settings()
+
+    @staticmethod
+    def _preferred_size() -> tuple[int, int]:
+        """按屏幕大小收敛窗口最小尺寸：够放课程表，又不超出屏幕"""
+        width, height = 580, 660
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, max(420, available.width() - 100))
+            height = min(height, max(420, available.height() - 80))
+        return width, height
 
     def _init_ui(self):
         """初始化界面"""
@@ -385,6 +456,7 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_city_tab(), "📍 城市设置")
         self.tabs.addTab(self._create_api_tab(), "🔑 API 配置")
+        self.tabs.addTab(self._create_course_tab(), "📅 课程表")
         main_layout.addWidget(self.tabs)
 
         # 底部按钮
@@ -413,14 +485,7 @@ class SettingsDialog(QDialog):
 
         # 当前模式
         mode_frame = QFrame()
-        mode_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: {CARD_BG};
-                border: 1px solid {BORDER_COLOR};
-                border-radius: {RADIUS_MEDIUM}px;
-                padding: 16px;
-            }}
-        """)
+        mode_frame.setStyleSheet(CARD_FRAME_STYLE)
         mode_layout = QVBoxLayout(mode_frame)
         mode_layout.setSpacing(12)
 
@@ -461,14 +526,7 @@ class SettingsDialog(QDialog):
 
         # 手动输入城市
         city_frame = QFrame()
-        city_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: {CARD_BG};
-                border: 1px solid {BORDER_COLOR};
-                border-radius: {RADIUS_MEDIUM}px;
-                padding: 16px;
-            }}
-        """)
+        city_frame.setStyleSheet(CARD_FRAME_STYLE)
         city_layout = QVBoxLayout(city_frame)
         city_layout.setSpacing(12)
 
@@ -519,14 +577,7 @@ class SettingsDialog(QDialog):
 
         # AI 模型选择器
         model_frame = QFrame()
-        model_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: {CARD_BG};
-                border: 1px solid {BORDER_COLOR};
-                border-radius: {RADIUS_MEDIUM}px;
-                padding: 16px;
-            }}
-        """)
+        model_frame.setStyleSheet(CARD_FRAME_STYLE)
         model_layout = QVBoxLayout(model_frame)
         model_layout.setSpacing(12)
 
@@ -547,14 +598,7 @@ class SettingsDialog(QDialog):
 
         # API Key 配置
         api_frame = QFrame()
-        api_frame.setStyleSheet(f"""
-            QFrame {{
-                background-color: {CARD_BG};
-                border: 1px solid {BORDER_COLOR};
-                border-radius: {RADIUS_MEDIUM}px;
-                padding: 16px;
-            }}
-        """)
+        api_frame.setStyleSheet(CARD_FRAME_STYLE)
         api_layout = QVBoxLayout(api_frame)
         api_layout.setSpacing(16)
 
@@ -657,6 +701,196 @@ class SettingsDialog(QDialog):
             self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
             self.btn_toggle_password.setText("👁")
 
+    # ── 课程表标签页 ────────────────────────────────
+
+    @staticmethod
+    def make_default_course() -> dict:
+        """新增行的默认课程（值都能通过 CourseService 校验）"""
+        return {
+            "name": "新课程",
+            "weekday": 1,
+            "start": "08:00",
+            "end": "09:40",
+            "room": "",
+            "remind_before": 10,
+            "enabled": True,
+        }
+
+    def _create_course_tab(self) -> QWidget:
+        """创建课程表标签页"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        help_frame = HelpFrame(
+            "📅",
+            "在这里录入每周的课程，程序每分钟检查一次：在「提前(分钟)」设定的时间点，\n"
+            "宠物会举手并弹出气泡提醒你上课。\n"
+            "星期用下拉框选择；时间写成 HH:MM（如 08:00），保存时会自动补零；\n"
+            "关掉「启用课程提醒」后不再提醒，但下面的课程数据会保留。",
+        )
+        layout.addWidget(help_frame)
+
+        # 总开关：对应 course_reminder_enabled
+        self.course_enabled_check = QCheckBox("启用课程提醒")
+        self.course_enabled_check.setToolTip("关闭后所有课程都不再提醒（数据保留）")
+        layout.addWidget(self.course_enabled_check)
+
+        # 表格卡片
+        card = QFrame()
+        card.setStyleSheet(CARD_FRAME_STYLE)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(12, 12, 12, 12)
+        card_layout.setSpacing(10)
+
+        self.course_table = QTableWidget(0, len(COURSE_COLUMNS))
+        self.course_table.setHorizontalHeaderLabels(COURSE_COLUMNS)
+        self.course_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.course_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.course_table.setAlternatingRowColors(True)
+        # 表格内嵌的下拉框沿用全局样式，但把高度压小，避免每行被撑到 40px 以上
+        self.course_table.setStyleSheet(
+            "QComboBox { min-height: 22px; padding: 2px 6px; border-width: 1px; }"
+        )
+        self.course_table.verticalHeader().setDefaultSectionSize(34)
+        self.course_table.verticalHeader().setVisible(False)
+        # 至少显示 8 行，超出滚动；小屏笔记本上降低高度，优先保证整窗不超出屏幕
+        table_height = 300
+        screen = QApplication.primaryScreen()
+        if screen is not None and screen.availableGeometry().height() < 900:
+            table_height = 210
+        self.course_table.setMinimumHeight(table_height)
+
+        header = self.course_table.horizontalHeader()
+        for col in range(len(COURSE_COLUMNS)):
+            mode = (QHeaderView.ResizeMode.Stretch
+                    if col in (COL_NAME, COL_ROOM)
+                    else QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(col, mode)
+        card_layout.addWidget(self.course_table)
+        layout.addWidget(card, 1)
+
+        # 增删按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        self.btn_add_course = SecondaryButton("➕ 添加课程")
+        self.btn_add_course.clicked.connect(lambda: self.add_course_row())
+        self.btn_del_course = SecondaryButton("➖ 删除选中")
+        self.btn_del_course.clicked.connect(self.remove_selected_courses)
+        btn_layout.addWidget(self.btn_add_course)
+        btn_layout.addWidget(self.btn_del_course)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        return tab
+
+    def add_course_row(self, course: dict | None = None) -> int:
+        """
+        在表格末尾追加一行课程，返回行号。
+
+        缺省字段用 make_default_course() 补齐，因此传入半截数据也不会出现空单元格；
+        测试也直接调用它来构造数据，保证"测试路径"和"用户点按钮"完全一致。
+        """
+        data = dict(self.make_default_course())
+        if course:
+            for key in data:
+                value = course.get(key)
+                if value is not None and value != "":
+                    data[key] = value
+
+        row = self.course_table.rowCount()
+        self.course_table.insertRow(row)
+
+        self._set_text_cell(row, COL_NAME, data["name"])
+        self.course_table.setCellWidget(row, COL_WEEKDAY, self._make_weekday_combo(data["weekday"]))
+        self._set_text_cell(row, COL_START, data["start"], "格式 HH:MM，例如 08:00")
+        self._set_text_cell(row, COL_END, data["end"], "格式 HH:MM，例如 09:40")
+        self._set_text_cell(row, COL_ROOM, data["room"], "留空表示不显示教室")
+        self._set_text_cell(row, COL_REMIND, data["remind_before"], "提前多少分钟提醒（0~120）")
+        self.course_table.setCellWidget(row, COL_ENABLED, self._make_enabled_widget(data["enabled"]))
+        return row
+
+    def remove_selected_courses(self) -> None:
+        """删除所有选中行（从后往前删，避免删一行后行号错位）"""
+        rows = sorted({index.row() for index in self.course_table.selectedIndexes()},
+                      reverse=True)
+        for row in rows:
+            self.course_table.removeRow(row)
+
+    def _set_text_cell(self, row: int, col: int, value, tooltip: str = "") -> None:
+        """写入文本单元格（统一带提示，时间列提示格式）"""
+        item = QTableWidgetItem("" if value is None else str(value))
+        if tooltip:
+            item.setToolTip(tooltip)
+        self.course_table.setItem(row, col, item)
+
+    @staticmethod
+    def _make_weekday_combo(weekday) -> QComboBox:
+        """星期下拉框：索引 +1 就是 ISO 星期，用户不可能填错数字"""
+        combo = QComboBox()
+        combo.addItems(WEEKDAY_ITEMS)
+        try:
+            index = int(weekday) - 1
+        except (TypeError, ValueError):
+            index = 0
+        combo.setCurrentIndex(index if 0 <= index < len(WEEKDAY_ITEMS) else 0)
+        return combo
+
+    @staticmethod
+    def _make_enabled_widget(checked) -> QWidget:
+        """「启用」列的复选框（居中摆放，并把复选框挂在容器上方便回读）"""
+        holder = QWidget()
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box = QCheckBox()
+        box.setChecked(bool(checked))
+        layout.addWidget(box)
+        holder.checkbox = box  # 回读时直接用 cellWidget(row, col).checkbox
+        return holder
+
+    def _cell_text(self, row: int, col: int) -> str:
+        """读取文本单元格（空单元格返回空串）"""
+        item = self.course_table.item(row, col)
+        return item.text().strip() if item is not None else ""
+
+    def _row_to_course(self, row: int) -> dict:
+        """把表格一行还原成课程原始数据（尚未校验）"""
+        combo = self.course_table.cellWidget(row, COL_WEEKDAY)
+        holder = self.course_table.cellWidget(row, COL_ENABLED)
+        box = getattr(holder, "checkbox", None)   # 取不到控件时按"启用"处理，避免误判成禁用
+        return {
+            "name": self._cell_text(row, COL_NAME),
+            "weekday": combo.currentIndex() + 1 if isinstance(combo, QComboBox) else 1,
+            "start": self._cell_text(row, COL_START),
+            "end": self._cell_text(row, COL_END),
+            "room": self._cell_text(row, COL_ROOM),
+            "remind_before": self._cell_text(row, COL_REMIND),
+            "enabled": box.isChecked() if box is not None else True,
+        }
+
+    def _collect_courses(self) -> tuple[list[dict] | None, str]:
+        """
+        校验并收集表格里的全部课程。
+
+        返回 (课程列表, "") 或 (None, "第 N 行：错误原因")。
+        校验交给 CourseService，保证设置页和存储层的规则只有一份实现。
+        """
+        courses: list[dict] = []
+        for row in range(self.course_table.rowCount()):
+            course, msg = CourseService.normalize_course(self._row_to_course(row))
+            if course is None:
+                return None, f"第 {row + 1} 行：{msg}"
+            courses.append(course)
+        return courses, ""
+
+    def _fill_course_table(self, courses: list[dict]) -> None:
+        """用课程表数据填充表格"""
+        self.course_table.setRowCount(0)
+        for course in courses:
+            self.add_course_row(course)
+
     # ── 加载设置 ────────────────────────────────────
 
     def _load_settings(self):
@@ -672,10 +906,26 @@ class SettingsDialog(QDialog):
         else:
             self._on_model_changed(self.model_combo.currentText())
 
+        # 课程表：总开关 + 逐行回填
+        self.course_enabled_check.setChecked(self.course_service.is_enabled())
+        self._fill_course_table(self.course_service.load_courses())
+
     # ── 保存 ────────────────────────────────────────
 
     def _save(self):
         """保存设置到数据库"""
+        # 先整体校验课程表：任何一行非法就中止保存（含城市、API 设置），
+        # 否则用户改坏一行时间就会连带把已经填好的其它设置一起写进去，
+        # 而且数据库里原有的课程数据会被半截数据覆盖。
+        courses, error = self._collect_courses()
+        if courses is None:
+            QMessageBox.warning(
+                self,
+                "课程表有误",
+                f"{error}\n\n请修正后再保存（本次未写入任何设置，原数据保持不变）。",
+            )
+            return
+
         # 保存城市设置
         if self.radio_manual.isChecked():
             city = self.city_input.text().strip()
@@ -697,9 +947,16 @@ class SettingsDialog(QDialog):
             self.db.set(f"{model_key}_api_key", api_key)
             if api_url:
                 self.db.set(f"{model_key}_api_url", api_url)
+            else:
+                # URL 留空 = 恢复默认端点，删掉旧值避免残留失效地址
+                self.db.delete(f"{model_key}_api_url")
 
         # 保存当前选中的模型
         self.db.set("current_ai_model", current_model)
+
+        # 保存课程表（校验已在上方通过）与总开关
+        self.course_service.save_courses(courses)
+        self.course_service.set_enabled(self.course_enabled_check.isChecked())
 
         QMessageBox.information(
             self,

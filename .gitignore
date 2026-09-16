@@ -17,3 +17,17 @@ knowledge_db/
 # IDE
 .idea/
 .vscode/
+
+# 本地 AI 助手工具的状态目录（会话记忆、临时截图等，与项目无关）
+.workbuddy/
+.workbuddy-ai/
+
+# 一次性调试草稿与测试输出（可随时重新生成，不纳入版本管理）
+env_check.txt
+test_bubble.py
+test_crash.py
+test_dbg.py
+test_*_out*.txt
+test_*_exit*.txt
+test_*_stderr*.txt
+test_report_*.txt

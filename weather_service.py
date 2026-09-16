@@ -110,13 +110,11 @@ class WeatherService:
         返回 {"cn": "成都", "en": "Chengdu"}
         """
         if self.city:
-            city_en = self.city
-            city_cn = self._CITY_CN_TO_EN.get(city_en, city_en)
-            # 反查：如果用户输入的是中文
+            # 反查：用户可能手动输入中文或英文城市名
             for cn, en in self._CITY_CN_TO_EN.items():
-                if en.lower() == city_en.lower() or cn == city_en:
+                if en.lower() == self.city.lower() or cn == self.city:
                     return {"cn": cn, "en": en}
-            return {"cn": city_en, "en": city_en}
+            return {"cn": self.city, "en": self.city}
 
         if self._auto_city is None:
             self._auto_city = self.detect_city()

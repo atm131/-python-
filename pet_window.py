@@ -6,7 +6,7 @@
 - 左键单击：打开 AI 对话窗口
 - 左键双击：查询天气 + 出行建议（气泡显示）
 - 左键拖拽：移动宠物位置，松手即保存
-- 右键单击：菜单（AI 对话 / 查询天气 / 系统状态 / 设置 / 退出）
+- 右键单击：菜单（AI 对话 / 查询天气 / 系统状态 / 今日课程 / 设置 / 退出）
 
 实现要点：
 天气气泡是独立顶层窗口而非子控件 —— Qt 会将子控件裁剪到父窗口
@@ -19,6 +19,7 @@ from PyQt6.QtCore import QPoint, Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
+from course_service import CourseService
 from db_manager import DBManager
 from settings_dialog import SettingsDialog
 from chat_dialog import ChatDialog
@@ -135,8 +136,8 @@ class WeatherBubble(QWidget):
         self.show()
         self.raise_()
 
-        # 创建新的淡出定时器
-        self._fade_out_timer = QTimer()
+        # 创建新的淡出定时器（父对象为 self，随窗口销毁自动清理）
+        self._fade_out_timer = QTimer(self)
         self._fade_out_timer.setSingleShot(True)
         self._fade_out_timer.timeout.connect(self._start_fade_out)
         self._fade_out_timer.start(duration_ms)
@@ -215,7 +216,7 @@ class PetWindow(QWidget):
     - 左键单击 → 打开 AI 对话窗口
     - 左键双击 → 查询天气 + 出行建议
     - 左键拖拽 → 移动（松手保存位置）
-    - 右键菜单 → 对话 / 天气 / 系统状态 / 设置 / 退出
+    - 右键菜单 → 对话 / 天气 / 系统状态 / 今日课程 / 设置 / 退出
     """
 
     def __init__(self, db: DBManager, weather_service: WeatherService, ui_config,
@@ -233,8 +234,11 @@ class PetWindow(QWidget):
         self._drag_threshold = 5
         self._mouse_press_pos = QPoint()
 
-        # 双击检测
-        self._last_click_time = 0
+        # 单击/双击区分：复用同一个定时器，避免每次点击都新建子定时器越积越多
+        self._last_click_time = 0.0
+        self._single_click_timer = QTimer(self)
+        self._single_click_timer.setSingleShot(True)
+        self._single_click_timer.timeout.connect(self._execute_single_click)
 
         # 加载全部状态立绘，默认待机
         self._pet_pixmaps = self._load_pet_images()
@@ -415,32 +419,20 @@ class PetWindow(QWidget):
         import time
         current_time = time.time()
 
-        # 检查是否是双击（400ms 内的第二次点击）
-        if hasattr(self, '_last_click_time') and self._last_click_time > 0:
-            time_diff = current_time - self._last_click_time
-            if time_diff < 0.4:  # 400ms 内两次点击视为双击
-                # 取消待执行的单击定时器
-                if hasattr(self, '_single_click_timer') and self._single_click_timer.isActive():
-                    self._single_click_timer.stop()
-                self._last_click_time = 0
-                self._on_double_click()
-                return
-
-        # 记录本次点击时间
-        self._last_click_time = current_time
-
-        # 创建单击定时器，等待可能的第二次点击
-        if hasattr(self, '_single_click_timer') and self._single_click_timer.isActive():
+        # 400ms 内的第二次点击视为双击：取消待执行的单击，触发双击
+        if 0 < current_time - self._last_click_time < 0.4:
             self._single_click_timer.stop()
+            self._last_click_time = 0.0
+            self._on_double_click()
+            return
 
-        self._single_click_timer = QTimer()
-        self._single_click_timer.setSingleShot(True)
-        self._single_click_timer.timeout.connect(self._execute_single_click)
-        self._single_click_timer.start(400)  # 400ms 后执行单击
+        # 记录本次点击时间，400ms 内没有第二次点击则执行单击
+        self._last_click_time = current_time
+        self._single_click_timer.start(400)
 
     def _execute_single_click(self):
         """执行单击操作（400ms 内没有第二次点击）"""
-        self._last_click_time = 0
+        self._last_click_time = 0.0
         self._on_single_click()
 
     def _on_single_click(self):
@@ -455,6 +447,15 @@ class PetWindow(QWidget):
 
     def _show_context_menu(self, pos: QPoint):
         """显示右键上下文菜单"""
+        self._build_context_menu().exec(pos)
+
+    def _build_context_menu(self) -> QMenu:
+        """
+        构建右键菜单。
+
+        拆出独立方法是为了可测试：菜单 exec() 会阻塞事件循环，
+        测试里改成断言菜单项列表，不必真的弹出。
+        """
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
@@ -489,6 +490,11 @@ class PetWindow(QWidget):
         act_system.triggered.connect(self._show_system_status)
         menu.addAction(act_system)
 
+        # 今日课程（数据来自设置页「📅 课程表」）
+        act_course = QAction("📅 今日课程", self)
+        act_course.triggered.connect(self._show_today_courses)
+        menu.addAction(act_course)
+
         menu.addSeparator()
 
         # 设置
@@ -503,7 +509,7 @@ class PetWindow(QWidget):
         act_quit.triggered.connect(self._quit_app)
         menu.addAction(act_quit)
 
-        menu.exec(pos)
+        return menu
 
     # ── 天气查询 ──────────────────────────────────
 
@@ -512,16 +518,10 @@ class PetWindow(QWidget):
         if self._weather_worker and self._weather_worker.isRunning():
             return
 
-        # 断开旧连接
-        if self._weather_worker:
-            try:
-                self._weather_worker.finished.disconnect(self._on_weather_result)
-            except:
-                pass
-
         self.set_state("weather", 15000)
         self.show_bubble("正在查询天气...", 3000)
 
+        # 旧 worker 已结束，直接丢弃换新（结束的 QThread 析构是安全的）
         self._weather_worker = WeatherWorker(self.weather_service)
         self._weather_worker.finished.connect(self._on_weather_result)
         self._weather_worker.start()
@@ -559,6 +559,20 @@ class PetWindow(QWidget):
         self.set_state("status", 10000)
         status_text = SystemStatus.get_status_summary()
         self.show_bubble(status_text, 8000)
+
+    # ── 今日课程 ──────────────────────────────────
+
+    def _show_today_courses(self):
+        """
+        右键菜单「📅 今日课程」：把当天的课拼成气泡显示。
+
+        课程数据由设置页「📅 课程表」录入，这里只读不写；
+        读取失败（数据库里的 JSON 被改坏）时 CourseService 会返回空表，
+        因此会走"今天没有课"分支，不会抛异常。
+        """
+        text = CourseService(self.db).day_text()
+        self.set_state("greet", 8000)
+        self.show_bubble(text, 10000)
 
     # ── 设置对话框 ────────────────────────────────
 

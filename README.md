@@ -28,9 +28,12 @@ python main.py
 | 左键单击 | 打开 AI 对话窗口（默认免费本地对话） |
 | 左键双击 | 查询天气 + 出行建议（气泡显示在宠物头顶） |
 | 左键拖拽 | 移动宠物位置，**松手即自动保存** |
-| 右键单击 | 菜单：AI 对话 / 查询天气 / 系统状态 / 设置 / 退出 |
+| 右键单击 | 菜单：AI 对话 / 查询天气 / 系统状态 / 今日课程 / 设置 / 退出 |
 
-对话窗口中还支持插件命令：`/天气 北京`、`/weather Shanghai`。
+对话窗口中还支持插件命令：`/天气 北京`、`/weather Shanghai`、`/课程`。
+
+设置窗口有三个页签：`📍 城市设置`、`🔑 API 配置`、`📅 课程表`。
+在「📅 课程表」里录入课程后，宠物会在上课前 N 分钟弹气泡提醒（见 4.7）。
 
 ---
 
@@ -77,10 +80,11 @@ python main.py
 | [settings_dialog.py](settings_dialog.py) | 设置窗口：城市定位模式、多 AI 模型 API 配置 | ✅ |
 | [ai_service.py](ai_service.py) | AI 服务：免费本地关键词对话 + 5 个 OpenAI 兼容模型 | ✅ |
 | [weather_service.py](weather_service.py) | 天气服务：wttr.in 查询、4 级 IP 定位容灾、中文翻译、出行建议 | ✅ |
+| [course_service.py](course_service.py) | 课程表：JSON 持久化、字段校验、提醒窗口判断（纯逻辑）+ `CourseReminder` 定时调度 | ✅ |
 | [system_status.py](system_status.py) | 系统状态：CPU/内存/磁盘/网络/电池的即时采集与摘要 | ✅ |
 | [system_monitor.py](system_monitor.py) | 后台监控线程：定时采集、阈值事件、历史记录 | ✅ |
 | [plugin_manager.py](plugin_manager.py) | 事件总线（发布-订阅）与插件加载/命令路由 | ✅ |
-| [plugins/](plugins/) | 插件目录，`weather_plugin.py` 提供 `/天气` 命令 | ✅ |
+| [plugins/](plugins/) | 插件目录：`weather_plugin.py` 提供 `/天气`，`course_plugin.py` 提供 `/课程` | ✅ |
 | [db_manager.py](db_manager.py) | SQLite 设置持久化（线程安全、连接即时关闭） | ✅ |
 | [config.py](config.py) | 全局配置类：UI / 宠物 / 监控 / RAG / LLM | ✅ |
 | [pet_ui.py](pet_ui.py) | 动画状态机版宠物 UI（自主巡逻 + 事件联动），独立演示 | ⭕ 可选 |
@@ -103,7 +107,9 @@ python rag_engine.py   # 离线验证「分块 → 向量化 → 检索」流程
 | `monitor.cpu_high` | CPU 超阈值（10 秒冷却去抖） | `main.py` → 气泡提醒 |
 | `monitor.mem_high` | 内存超阈值（10 秒冷却去抖） | `main.py` → 气泡提醒 |
 | `monitor.load_change` | 综合负载等级变化 | `pet_ui.py` 状态切换 |
-| `pet.show_bubble` | 插件请求显示气泡 | `pet_ui.py` |
+| `pet.show_bubble` | 请求显示气泡（`{"text", "duration"}`） | `main.py`（转发到 GUI 线程）→ 宠物气泡 |
+| `pet.state` | 请求切换宠物形象（`{"state", "revert_after_ms"}`） | `PetWindow`；课程提醒用 `greet` |
+| `chat.reply` | AI 回复到达 | `PetWindow` → 开心表情 |
 | `llm.stream_start/token/end` | 大模型流式输出 | `pet_ui.py` |
 
 ---
@@ -147,6 +153,7 @@ QApplication.primaryScreen().grabWindow(0, x, y, w, h).save("shot.png")
 | 天气查询 | `WeatherWorker(QThread)` | 网络请求最长 10 秒，不能阻塞 UI |
 | AI 对话 | `ChatWorker(QThread)` | API 请求最长 30 秒 |
 | 系统监控采集 | `SystemMonitor` 守护线程 | 周期性采集，事件通知 UI |
+| 课程提醒检查 | GUI 线程 `QTimer`（60 秒） | 纯计算、无网络，直接在 GUI 线程走事件总线最安全 |
 | 设置读写 | 主线程 / 工作线程各自建连接 | SQLite 连接不跨线程共享 |
 
 ### 4.4 数据库
@@ -155,6 +162,7 @@ QApplication.primaryScreen().grabWindow(0, x, y, w, h).save("shot.png")
 - **每次操作新建连接并用 `contextlib.closing` 显式关闭**：
   `with sqlite3.connect(...)` 只管理事务，不会关闭连接，长期运行会泄漏文件句柄
 - 连接设置 `timeout=5.0`，避免工作线程与 UI 线程并发写入时立即报锁冲突
+- 多字段数据（如课程表）序列化成 JSON 字符串存进 `value`，不新建表、不引入 ORM（见 4.7）
 
 ### 4.5 宠物形象与图标
 
@@ -219,6 +227,69 @@ pet.set_state("happy", revert_after_ms=4000)   # 4 秒后自动回到 idle
 bus.emit("pet.state", {"state": "happy", "revert_after_ms": 3000})
 ```
 
+### 4.7 课程表提醒
+
+在设置页「📅 课程表」录入课程后，`CourseReminder` 每分钟检查一次，
+上课前 N 分钟由宠物举手并弹气泡提醒：
+
+```
+📚 还有 10 分钟上课
+高等数学 · 08:00-09:40
+📍 教三-201
+```
+
+**数据存储**：不新建表、不新增依赖 —— 课程表序列化成 JSON 字符串存进同一张
+`settings(key, value)` 表，因此 value 仍是字符串：
+
+| key | 内容 |
+|---|---|
+| `course_schedule` | JSON 数组（`ensure_ascii=False`，中文直接可读） |
+| `course_reminder_enabled` | 总开关，`"1"` / `"0"`，默认开启 |
+
+```json
+[
+  {
+    "name": "高等数学", "weekday": 1,
+    "start": "08:00", "end": "09:40", "room": "教三-201",
+    "remind_before": 10, "enabled": true
+  }
+]
+```
+
+`weekday` 用 ISO 标准（1=周一 … 7=周日），可直接与 `date.isoweekday()` 比较。
+
+**提醒规则**：`CourseReminder` 用 `QTimer`（60 秒间隔）驱动，启动时立刻检查一遍
+（程序可能正好在提醒窗口内启动）。判断条件为
+`0 < 开课时间 - now <= remind_before`，**用完整 datetime 相减**而不是比较
+`hour`/`minute` —— 否则周三 00:05 的课在周二 23:55 会被判成"已过去"，跨零点算错。
+每次 tick 都重新从数据库读课程表，所以改完设置保存后 ≤60 秒即生效，无需重启。
+
+**去重机制**：同一门课同一天只提醒一次，用 `set` 记录
+`f"{上课日期}-{课程名}-{开始时间}"`。键里带的是**上课那一天**的日期而非"当前日期"，
+这样跨零点的课（周二 23:55 提醒周三 00:05）在跨天后不会被重复提醒；
+`_prune_seen()` 每次检查时丢弃早于今天的键，集合不会随运行时间无限增长。
+
+**线程模型**：全部逻辑都在 GUI 线程内用 `QTimer` 完成，不新建线程、不做网络请求。
+检查逻辑（`CourseService`）本身不依赖 Qt，便于用固定 `datetime` 直接单测；
+`CourseReminder` 只在 `QApplication` 创建之后由 `main.py` 实例化 ——
+插件加载早于 `QApplication`，在那里创建 `QTimer` 是不安全的。
+
+**输入容错与校验**：`CourseService.normalize_course()` 是唯一一份校验实现，
+设置页保存前逐行调用它，任一行非法就中止保存（含城市、API 设置），
+避免把数据库里已有的课程数据覆盖成半截数据：
+
+| 场景 | 行为 |
+|---|---|
+| `8:00`、`8：00`（全角冒号）、`８：００`（全角数字） | 规范化为 `08:00` |
+| `25:00`、`abc`、`09:00-08:00`（start ≥ end） | 提示"第 N 行：错在哪"，中止保存 |
+| `weekday` 越界、课程名为空、`remind_before` 不是 0~120 的整数 | 同上 |
+| 数据库里的 JSON 被改坏 / 字段非法 | `load_courses()` 打印警告并返回空表，不抛异常 |
+| 总开关关闭、课程 `enabled` 为假、课程表为空 | 静默跳过，不报错、不弹空气泡 |
+
+提醒气泡复用 `PetWindow.show_bubble()`（独立顶层窗口，见 4.1），
+文案格式见 `CourseService.format_reminder()`；右键菜单「📅 今日课程」与
+`/课程` 命令复用 `CourseService.day_text()`。
+
 ---
 
 ## 五、天气服务说明
@@ -261,6 +332,25 @@ class MyPlugin(PluginBase):
 ```
 
 重启应用后，在对话窗口输入 `/你好` 即可触发。
+
+插件默认拿不到数据库。`PluginManager(bus, plugins_dir="plugins", db=...)` 会把共享的
+`DBManager` 注入到 `plugin.db`（未注入时为 `None`），插件就能像主程序一样读设置 ——
+`plugins/course_plugin.py` 的 `/课程` 命令就是这样读取课程表的：
+
+```python
+class CoursePlugin(PluginBase):
+    name = "课程表"
+
+    def setup(self):
+        self.register_command("课程", "查看今日课程", self.handle_courses)
+
+    def handle_courses(self, args: dict) -> str:
+        from course_service import CourseService
+        return CourseService(self.db).day_text()
+```
+
+⚠️ `setup()` 在 `QApplication` 创建之前执行，**不要在插件里创建 `QTimer` 或任何 Qt 对象**；
+需要定时器就放到服务模块里，由 `main.py` 在 `QApplication` 之后实例化（参考 `CourseReminder`）。
 
 ### 添加 AI 模型
 

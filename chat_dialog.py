@@ -114,6 +114,11 @@ class ChatDialog(QDialog):
     单击宠物时弹出，可以与 AI 进行对话
     """
 
+    # 仍在运行的后台线程注册表（类级强引用）。
+    # 对话框关闭后线程可能仍在请求网络，若无强引用，Python 对象被 GC
+    # 会导致 QThread 在运行中被析构（Qt 直接 qFatal 崩溃）。
+    _active_workers: set = set()
+
     def __init__(self, db: DBManager, parent=None, plugin_manager=None):
         super().__init__(parent)
         self.db = db
@@ -121,6 +126,8 @@ class ChatDialog(QDialog):
         self.plugin_manager = plugin_manager  # 支持 /天气 等插件命令
         self._chat_worker = None
         self._thinking_pos = None  # "思考中"占位消息的文档位置
+        # 关闭即销毁：避免每次对话都在 PetWindow 下累积一个永不释放的隐藏对话框
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._init_ui()
 
     def _init_ui(self):
@@ -282,10 +289,19 @@ class ChatDialog(QDialog):
         if self.plugin_manager is not None and message.startswith("/"):
             handler = self._dispatch_or_chat
 
-        # 启动 AI 回复线程
-        self._chat_worker = ChatWorker(self.ai_service, message, handler=handler)
-        self._chat_worker.finished.connect(self._on_ai_response)
-        self._chat_worker.start()
+        # 启动 AI 回复线程。
+        # 生命周期管理：注册表强引用保管到线程结束，
+        # finished → deleteLater 延迟销毁，destroyed → 移出注册表。
+        worker = ChatWorker(self.ai_service, message, handler=handler)
+        self._chat_worker = worker
+        ChatDialog._active_workers.add(worker)
+        worker.finished.connect(self._on_ai_response)
+        worker.finished.connect(worker.deleteLater)
+        # 注意：destroyed 发射时原 Python 包装已失效，信号参数是新建的
+        # 包装对象，按身份匹配不到注册表里的项 —— 必须闭包捕获 worker 本身
+        worker.destroyed.connect(
+            lambda _obj=None, _w=worker: ChatDialog._active_workers.discard(_w))
+        worker.start()
 
     def _dispatch_or_chat(self, message: str) -> str:
         """先尝试插件命令，无匹配命令再交给 AI（在后台线程中执行）"""
@@ -296,6 +312,7 @@ class ChatDialog(QDialog):
 
     def _on_ai_response(self, response: str):
         """AI 回复完成"""
+        self._chat_worker = None  # 线程对象随即由 deleteLater 销毁，解除引用
         # 移除"思考中"的占位消息
         if self._thinking_pos is not None:
             self._remove_last_message(self._thinking_pos)
@@ -370,8 +387,9 @@ class ChatDialog(QDialog):
         直接对 toHtml() 做字符串裁剪不可靠（Qt 会重写 HTML 结构），
         这里用 QTextCursor 按文档位置删除，并清掉可能残留的空段落。
         """
-        if from_pos < 0:
-            return
+        # 位置钳制：若期间清空过对话，过期位置不能越界
+        doc_end = self.chat_history.document().characterCount() - 1
+        from_pos = max(0, min(from_pos, doc_end))
         cursor = self.chat_history.textCursor()
         cursor.setPosition(from_pos)
         cursor.movePosition(QTextCursor.MoveOperation.End,
@@ -385,14 +403,25 @@ class ChatDialog(QDialog):
             cursor.removeSelectedText()
 
     def closeEvent(self, event):
-        """关闭前等待后台线程结束，避免线程回调已销毁的窗口"""
-        if self._chat_worker and self._chat_worker.isRunning():
-            self._chat_worker.wait(3000)
+        """
+        关闭时对话框立即销毁（WA_DeleteOnClose），不阻塞等待后台线程。
+        若线程仍在请求网络（API 超时最长 30 秒），断开回复回调，
+        线程由类级注册表保管，结束后自行销毁，不会回调已销毁的窗口。
+        """
+        worker = self._chat_worker
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    worker.finished.disconnect(self._on_ai_response)
+            except RuntimeError:
+                pass  # 线程对象底层已销毁，无需处理
+            self._chat_worker = None
         super().closeEvent(event)
 
     def _clear_history(self):
         """清空对话历史"""
         self.chat_history.clear()
+        self._thinking_pos = None  # 使等待中的占位位置失效，防止误删新内容
         self._add_message("🤖 AI 助手", "对话已清空，有什么可以帮你的吗？", is_user=False)
 
 

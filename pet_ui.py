@@ -274,7 +274,7 @@ class ChatBubble(QWidget):
         self.show()
         self.raise_()
 
-        self._fade_out_timer = QTimer()
+        self._fade_out_timer = QTimer(self)
         self._fade_out_timer.setSingleShot(True)
         self._fade_out_timer.timeout.connect(self._start_fade_out)
         self._fade_out_timer.start(duration_ms)
@@ -431,6 +431,7 @@ class DesktopPet(QWidget):
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(self.pet_config.width, self.pet_config.height)
+        self._update_mask()  # 应用圆形可交互区域，其余区域鼠标穿透
 
         # 初始位置：屏幕右下角
         screen = QApplication.primaryScreen().geometry()
